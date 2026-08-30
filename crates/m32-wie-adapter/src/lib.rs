@@ -698,6 +698,58 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FirstFrameCaptureDisplayHost {
+        size: Mutex<DisplaySize>,
+        redraw_count: Mutex<u32>,
+        present_count: Mutex<u32>,
+        first_frame: Mutex<Option<RgbaFrame>>,
+    }
+
+    impl FirstFrameCaptureDisplayHost {
+        fn first_frame(&self) -> Option<RgbaFrame> {
+            self.first_frame.lock().expect("first-frame mutex poisoned").clone()
+        }
+
+        fn redraw_count(&self) -> u32 {
+            *self.redraw_count.lock().expect("redraw-count mutex poisoned")
+        }
+
+        fn present_count(&self) -> u32 {
+            *self.present_count.lock().expect("present-count mutex poisoned")
+        }
+    }
+
+    impl DisplayHost for FirstFrameCaptureDisplayHost {
+        fn resize(&self, size: DisplaySize) -> Result<(), DisplayHostError> {
+            *self.size.lock().expect("capture size mutex poisoned") = size;
+            Ok(())
+        }
+
+        fn request_redraw(&self) -> Result<(), DisplayHostError> {
+            let mut count = self.redraw_count.lock().expect("redraw-count mutex poisoned");
+            *count += 1;
+            Ok(())
+        }
+
+        fn present_rgba8(&self, frame: RgbaFrame) -> Result<(), DisplayHostError> {
+            let mut count = self.present_count.lock().expect("present-count mutex poisoned");
+            *count += 1;
+            drop(count);
+
+            let mut first = self.first_frame.lock().expect("first-frame mutex poisoned");
+            if first.is_none() {
+                *first = Some(frame);
+            }
+
+            Ok(())
+        }
+
+        fn size(&self) -> DisplaySize {
+            *self.size.lock().expect("capture size mutex poisoned")
+        }
+    }
+
     struct SyntheticWieImage;
 
     impl wie_backend::canvas::Image for SyntheticWieImage {
@@ -1859,12 +1911,13 @@ mod tests {
         );
     }
 
-    fn recording_platform_hosts_with_observers(
+    fn recording_platform_hosts_with_display_and_observers(
+        display: Arc<dyn DisplayHost>,
         output: Arc<RecordingOutput>,
         filesystem: Arc<RecordingFilesystemHost>,
     ) -> WiePlatformHosts {
         WiePlatformHosts {
-            display: Arc::new(RecordingDisplayHost::default()),
+            display,
             clock: Arc::new(FixedClock(1_725_123_456_789)),
             database: Arc::new(RecordingDatabaseRepository::default()),
             filesystem,
@@ -1873,6 +1926,17 @@ mod tests {
             exit: Arc::new(RecordingExit::default()),
             vibration: Arc::new(RecordingVibration::default()),
         }
+    }
+
+    fn recording_platform_hosts_with_observers(
+        output: Arc<RecordingOutput>,
+        filesystem: Arc<RecordingFilesystemHost>,
+    ) -> WiePlatformHosts {
+        recording_platform_hosts_with_display_and_observers(
+            Arc::new(RecordingDisplayHost::default()),
+            output,
+            filesystem,
+        )
     }
 
     fn recording_platform_hosts_with_output(output: Arc<RecordingOutput>) -> WiePlatformHosts {
@@ -2204,6 +2268,61 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
         assert_eq!(screen.width(), 240);
         assert_eq!(screen.height(), 320);
         assert_eq!(*host.redraw_count.lock().expect("redraw mutex poisoned"), 1);
+    }
+
+    #[test]
+    fn first_frame_capture_host_does_not_invent_frame_before_present() {
+        let host = FirstFrameCaptureDisplayHost::default();
+
+        host.resize(DisplaySize::new(176, 220))
+            .expect("capture resize must succeed");
+        host.request_redraw().expect("capture redraw request must succeed");
+
+        assert_eq!(host.size(), DisplaySize::new(176, 220));
+        assert_eq!(host.redraw_count(), 1);
+        assert_eq!(host.present_count(), 0);
+        assert_eq!(host.first_frame(), None);
+    }
+
+    #[test]
+    fn first_frame_capture_host_locks_the_first_presented_frame() {
+        let host = FirstFrameCaptureDisplayHost::default();
+
+        let first = RgbaFrame::try_new(DisplaySize::new(2, 1), vec![1, 2, 3, 255, 4, 5, 6, 255])
+            .expect("first synthetic frame must be valid");
+        let second = RgbaFrame::try_new(DisplaySize::new(2, 1), vec![9, 8, 7, 255, 6, 5, 4, 255])
+            .expect("second synthetic frame must be valid");
+
+        host.present_rgba8(first.clone())
+            .expect("first frame capture must succeed");
+        host.present_rgba8(second)
+            .expect("later frame presentation must succeed");
+
+        assert_eq!(host.present_count(), 2);
+        assert_eq!(host.first_frame(), Some(first));
+    }
+
+    #[test]
+    fn wie_screen_adapter_feeds_rgba8_into_first_frame_capture_host() {
+        let host = Arc::new(FirstFrameCaptureDisplayHost::default());
+        let screen = WieScreenAdapter::new(host.clone());
+
+        screen.resize(2, 1).expect("WIE screen resize must reach capture host");
+        screen
+            .request_redraw()
+            .expect("WIE redraw request must reach capture host");
+        screen.paint(&SyntheticWieImage);
+
+        assert_eq!(host.size(), DisplaySize::new(2, 1));
+        assert_eq!(host.redraw_count(), 1);
+        assert_eq!(host.present_count(), 1);
+
+        let frame = host
+            .first_frame()
+            .expect("WIE screen paint must capture the first frame");
+
+        assert_eq!(frame.size, DisplaySize::new(2, 1));
+        assert_eq!(frame.pixels, vec![10, 20, 30, 255, 40, 50, 60, 128]);
     }
 
     #[test]
