@@ -1884,6 +1884,42 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
         assert_eq!(session.state(), SessionState::Ready);
     }
 
+    const FIRST_FRAME_BOOT_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-first-frame-boot.jad");
+    const FIRST_FRAME_BOOT_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-first-frame-boot.jar");
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|window| window == needle)
+    }
+
+    #[test]
+    fn first_frame_boot_fixture_has_expected_container_and_class_identity() {
+        assert!(FIRST_FRAME_BOOT_JAR.starts_with(b"PK\x03\x04"));
+        assert!(contains_bytes(FIRST_FRAME_BOOT_JAR, b"m32/FirstFrameMidlet.class"));
+        assert!(contains_bytes(FIRST_FRAME_BOOT_JAR, b"m32/FirstFrameMidlet"));
+        assert!(contains_bytes(
+            FIRST_FRAME_BOOT_JAR,
+            &[0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34]
+        ));
+        assert!(contains_bytes(
+            FIRST_FRAME_BOOT_JAD,
+            b"MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet"
+        ));
+    }
+
+    #[test]
+    fn first_frame_boot_fixture_constructs_ready_j2me_session() {
+        let session = create_j2me_jad_jar_session(
+            recording_platform_hosts(),
+            FIRST_FRAME_BOOT_JAD.to_vec(),
+            "j2me-first-frame-boot.jar".to_owned(),
+            FIRST_FRAME_BOOT_JAR.to_vec(),
+        )
+        .expect("deterministic boot fixture must construct a Ready J2ME session");
+
+        assert_eq!(session.backend(), wie_backend_descriptor());
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
     #[test]
     fn session_create_error_maps_to_stable_m32_code() {
         let error = map_session_create_error("synthetic constructor failure");
