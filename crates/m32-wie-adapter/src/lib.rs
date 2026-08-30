@@ -6,13 +6,26 @@
 use std::fmt::Display;
 
 use m32_emulator_api::{
-    BackendDescriptor, EmulatorBackend, EmulatorSession, EmulatorSessionError, SessionErrorCode, SessionState,
+    BackendDescriptor, EmulatorBackend, EmulatorSession, EmulatorSessionError, HostServiceKind, SessionErrorCode,
+    SessionState,
 };
 
 pub const WIE_REPOSITORY: &str = "https://github.com/dlunch/wie.git";
 pub const WIE_REVISION: &str = "f0513eb758c02736981f545ad030eed937d55f3e";
 pub const WIE_BACKEND_ID: &str = "wie";
 pub const WIE_BACKEND_DISPLAY_NAME: &str = "WIE";
+
+pub const WIE_REQUIRED_HOST_SERVICES: &[HostServiceKind] = &[
+    HostServiceKind::Display,
+    HostServiceKind::Clock,
+    HostServiceKind::Database,
+    HostServiceKind::Filesystem,
+    HostServiceKind::Audio,
+    HostServiceKind::Stdout,
+    HostServiceKind::Stderr,
+    HostServiceKind::Exit,
+    HostServiceKind::Vibration,
+];
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WieBackendAdapter;
@@ -27,6 +40,10 @@ impl WieBackendAdapter {
 impl EmulatorBackend for WieBackendAdapter {
     fn descriptor(&self) -> BackendDescriptor {
         wie_backend_descriptor()
+    }
+
+    fn required_host_services(&self) -> &'static [HostServiceKind] {
+        WIE_REQUIRED_HOST_SERVICES
     }
 }
 
@@ -95,6 +112,44 @@ mod tests {
         assert_eq!(descriptor.id, WIE_BACKEND_ID);
         assert_eq!(descriptor.display_name, WIE_BACKEND_DISPLAY_NAME);
         assert_eq!(descriptor.upstream_revision, WIE_REVISION);
+    }
+
+    #[test]
+    fn adapter_declares_all_wie_platform_host_requirements() {
+        let backend: &dyn EmulatorBackend = &WieBackendAdapter::new();
+
+        assert_eq!(
+            backend.required_host_services(),
+            &[
+                HostServiceKind::Display,
+                HostServiceKind::Clock,
+                HostServiceKind::Database,
+                HostServiceKind::Filesystem,
+                HostServiceKind::Audio,
+                HostServiceKind::Stdout,
+                HostServiceKind::Stderr,
+                HostServiceKind::Exit,
+                HostServiceKind::Vibration,
+            ]
+        );
+    }
+
+    #[test]
+    fn pinned_wie_platform_surface_is_still_compatible() {
+        fn compile_probe(platform: &dyn wie_backend::Platform) {
+            let _: &dyn wie_backend::Screen = platform.screen();
+            let _: wie_backend::Instant = platform.now();
+            let _: &dyn wie_backend::DatabaseRepository = platform.database_repository();
+            let _: &dyn wie_backend::Filesystem = platform.filesystem();
+            let _: Box<dyn wie_backend::AudioSink> = platform.audio_sink();
+
+            platform.write_stdout(&[]);
+            platform.write_stderr(&[]);
+            platform.exit();
+            platform.vibrate(0, 0);
+        }
+
+        let _ = compile_probe as fn(&dyn wie_backend::Platform);
     }
 
     #[test]

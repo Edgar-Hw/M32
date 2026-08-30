@@ -25,8 +25,39 @@ impl BackendDescriptor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostServiceKind {
+    Display,
+    Clock,
+    Database,
+    Filesystem,
+    Audio,
+    Stdout,
+    Stderr,
+    Exit,
+    Vibration,
+}
+
+impl HostServiceKind {
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Display => "display",
+            Self::Clock => "clock",
+            Self::Database => "database",
+            Self::Filesystem => "filesystem",
+            Self::Audio => "audio",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Exit => "exit",
+            Self::Vibration => "vibration",
+        }
+    }
+}
+
 pub trait EmulatorBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
+    fn required_host_services(&self) -> &'static [HostServiceKind];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,6 +112,10 @@ mod tests {
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor::new("synthetic", "Synthetic Backend", "test-revision")
         }
+
+        fn required_host_services(&self) -> &'static [HostServiceKind] {
+            &[]
+        }
     }
 
     struct SyntheticSession {
@@ -124,6 +159,47 @@ mod tests {
         assert_eq!(descriptor.id, "synthetic");
         assert_eq!(descriptor.display_name, "Synthetic Backend");
         assert_eq!(descriptor.upstream_revision, "test-revision");
+        assert!(backend.required_host_services().is_empty());
+    }
+
+    #[test]
+    fn host_service_ids_are_stable() {
+        let services = [
+            (HostServiceKind::Display, "display"),
+            (HostServiceKind::Clock, "clock"),
+            (HostServiceKind::Database, "database"),
+            (HostServiceKind::Filesystem, "filesystem"),
+            (HostServiceKind::Audio, "audio"),
+            (HostServiceKind::Stdout, "stdout"),
+            (HostServiceKind::Stderr, "stderr"),
+            (HostServiceKind::Exit, "exit"),
+            (HostServiceKind::Vibration, "vibration"),
+        ];
+
+        for (service, expected_id) in services {
+            assert_eq!(service.id(), expected_id);
+        }
+    }
+
+    #[test]
+    fn host_service_kinds_are_distinct() {
+        let services = [
+            HostServiceKind::Display,
+            HostServiceKind::Clock,
+            HostServiceKind::Database,
+            HostServiceKind::Filesystem,
+            HostServiceKind::Audio,
+            HostServiceKind::Stdout,
+            HostServiceKind::Stderr,
+            HostServiceKind::Exit,
+            HostServiceKind::Vibration,
+        ];
+
+        for left in 0..services.len() {
+            for right in left + 1..services.len() {
+                assert_ne!(services[left], services[right]);
+            }
+        }
     }
 
     #[test]
