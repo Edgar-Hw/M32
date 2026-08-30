@@ -3,7 +3,11 @@
 //! WIE backend types stay private to this crate. M32-facing callers consume contracts from
 //! `m32-emulator-api`.
 
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
 
 use m32_emulator_api::{
     BackendDescriptor, ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
@@ -581,14 +585,23 @@ impl EmulatorSession for WieSession {
     }
 
     fn tick(&mut self) -> Result<(), EmulatorSessionError> {
-        match self.emulator.tick() {
-            Ok(()) => {
+        match catch_unwind(AssertUnwindSafe(|| self.emulator.tick())) {
+            Ok(Ok(())) => {
                 self.state = SessionState::Running;
                 Ok(())
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.state = SessionState::Faulted;
                 Err(map_tick_error(error))
+            }
+            Err(_) => {
+                self.state = SessionState::Faulted;
+                tracing::error!(
+                    target: "m32::emulator",
+                    event = "wie_tick_panicked",
+                    "Pinned WIE backend panicked during tick"
+                );
+                Err(map_tick_panic())
             }
         }
     }
@@ -600,6 +613,13 @@ fn wie_backend_descriptor() -> BackendDescriptor {
 
 fn map_tick_error(error: impl Display) -> EmulatorSessionError {
     EmulatorSessionError::new(SessionErrorCode::BackendTickFailed, error.to_string())
+}
+
+fn map_tick_panic() -> EmulatorSessionError {
+    EmulatorSessionError::new(
+        SessionErrorCode::BackendTickFailed,
+        "pinned WIE backend panicked during tick",
+    )
 }
 
 fn map_display_host_error(error: DisplayHostError) -> WieError {
@@ -1822,6 +1842,37 @@ mod tests {
         assert_eq!(error.message, "synthetic constructor failure");
     }
 
+    const CORE_SMOKE_MISSING_MAIN_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-core-smoke-missing-main.jar");
+    const CORE_SMOKE_MAX_TICKS: usize = 512;
+
+    #[test]
+    fn j2me_core_smoke_ticks_real_runtime_to_stable_fault_boundary() {
+        let mut session = create_j2me_jar_session(
+            recording_platform_hosts(),
+            "j2me-core-smoke-missing-main.jar",
+            CORE_SMOKE_MISSING_MAIN_JAR.to_vec(),
+        )
+        .expect("synthetic JAR constructor must create a Ready WIE J2ME session");
+
+        assert_eq!(session.state(), SessionState::Ready);
+
+        for _ in 0..CORE_SMOKE_MAX_TICKS {
+            match session.tick() {
+                Ok(()) => continue,
+                Err(error) => {
+                    assert_eq!(error.code, SessionErrorCode::BackendTickFailed);
+                    assert_eq!(session.state(), SessionState::Faulted);
+                    assert!(!error.message.is_empty());
+                    return;
+                }
+            }
+        }
+
+        panic!(
+            "synthetic missing-main JAR did not reach the expected fault boundary within {CORE_SMOKE_MAX_TICKS} ticks"
+        );
+    }
+
     #[test]
     fn upstream_revision_matches_locked_baseline() {
         assert_eq!(WIE_REPOSITORY, "https://github.com/dlunch/wie.git");
@@ -1941,6 +1992,32 @@ mod tests {
         fn assert_session<T: EmulatorSession>() {}
 
         assert_session::<WieSession>();
+    }
+
+    struct PanickingWieEmulator;
+
+    impl wie_backend::Emulator for PanickingWieEmulator {
+        fn handle_event(&mut self, _event: wie_backend::Event) {}
+
+        fn tick(&mut self) -> wie_util::Result<()> {
+            panic!("synthetic upstream WIE panic");
+        }
+    }
+
+    #[test]
+    fn wie_tick_panic_maps_to_faulted_stable_m32_error() {
+        let mut session = WieSession {
+            emulator: Box::new(PanickingWieEmulator),
+            state: SessionState::Ready,
+        };
+
+        let error = session
+            .tick()
+            .expect_err("upstream panic must be contained by the M32 adapter");
+
+        assert_eq!(error.code, SessionErrorCode::BackendTickFailed);
+        assert_eq!(error.message, "pinned WIE backend panicked during tick");
+        assert_eq!(session.state(), SessionState::Faulted);
     }
 
     #[test]
