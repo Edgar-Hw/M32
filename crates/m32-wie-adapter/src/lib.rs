@@ -2146,6 +2146,46 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
         );
     }
 
+    const FIRST_FRAME_PAINT_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-first-frame-paint.jad");
+    const FIRST_FRAME_PAINT_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-first-frame-paint.jar");
+    const FIRST_FRAME_PAINT_CANVAS_SOURCE: &str = include_str!("../test-fixtures/src/m32/PaintCanvas.java");
+    const FIRST_FRAME_PAINT_MIDLET_SOURCE: &str = include_str!("../test-fixtures/src/m32/PaintMidlet.java");
+
+    #[test]
+    fn first_frame_paint_fixture_locks_canvas_and_pixel_pattern_contract() {
+        assert!(FIRST_FRAME_PAINT_JAR.starts_with(b"PK\x03\x04"));
+        assert!(contains_bytes(
+            FIRST_FRAME_PAINT_JAD,
+            b"MIDlet-1: M32 Paint,,m32.PaintMidlet"
+        ));
+        assert!(contains_bytes(FIRST_FRAME_PAINT_JAR, b"m32/PaintMidlet.class"));
+        assert!(contains_bytes(FIRST_FRAME_PAINT_JAR, b"m32/PaintCanvas.class"));
+        assert!(contains_bytes(FIRST_FRAME_PAINT_JAR, b"m32/PaintMidlet"));
+        assert!(contains_bytes(FIRST_FRAME_PAINT_JAR, b"m32/PaintCanvas"));
+
+        assert!(FIRST_FRAME_PAINT_MIDLET_SOURCE.contains("Display.getDisplay(this).setCurrent(new PaintCanvas());"));
+        assert!(FIRST_FRAME_PAINT_MIDLET_SOURCE.contains("M32_FIRST_FRAME_CANVAS_READY"));
+
+        assert!(FIRST_FRAME_PAINT_CANVAS_SOURCE.contains("graphics.setColor(0x0E1114);"));
+        assert!(FIRST_FRAME_PAINT_CANVAS_SOURCE.contains("graphics.fillRect(0, 0, 176, 220);"));
+        assert!(FIRST_FRAME_PAINT_CANVAS_SOURCE.contains("graphics.setColor(0xD14A36);"));
+        assert!(FIRST_FRAME_PAINT_CANVAS_SOURCE.contains("graphics.fillRect(0, 0, 16, 16);"));
+    }
+
+    #[test]
+    fn first_frame_paint_fixture_constructs_ready_j2me_session() {
+        let session = create_j2me_jad_jar_session(
+            recording_platform_hosts(),
+            FIRST_FRAME_PAINT_JAD.to_vec(),
+            "j2me-first-frame-paint.jar".to_owned(),
+            FIRST_FRAME_PAINT_JAR.to_vec(),
+        )
+        .expect("paint fixture must construct a Ready J2ME session");
+
+        assert_eq!(session.backend(), wie_backend_descriptor());
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
     #[test]
     fn session_create_error_maps_to_stable_m32_code() {
         let error = map_session_create_error("synthetic constructor failure");
