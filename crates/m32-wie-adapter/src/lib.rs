@@ -7,8 +7,8 @@ use std::{fmt::Display, sync::Arc};
 
 use m32_emulator_api::{
     BackendDescriptor, ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
-    EmulatorSessionError, ExitHost, GuestOutputHost, HostServiceKind, RgbaFrame, SessionErrorCode, SessionState,
-    VibrationHost,
+    EmulatorSessionError, ExitHost, GuestFilesystemError, GuestFilesystemHost, GuestOutputHost, HostServiceKind,
+    RgbaFrame, SessionErrorCode, SessionState, VibrationHost,
 };
 use wie_util::WieError;
 
@@ -91,6 +91,98 @@ impl WieBasicHostBridge {
     pub fn vibrate(&self, duration_ms: u64, intensity: u8) {
         self.vibration.vibrate(duration_ms, intensity);
     }
+}
+
+pub struct WieFilesystemAdapter {
+    host: Arc<dyn GuestFilesystemHost>,
+}
+
+impl WieFilesystemAdapter {
+    #[must_use]
+    pub fn new(host: Arc<dyn GuestFilesystemHost>) -> Self {
+        Self { host }
+    }
+}
+
+#[async_trait::async_trait]
+impl wie_backend::Filesystem for WieFilesystemAdapter {
+    async fn exists(&self, aid: &str, path: &str) -> bool {
+        match self.host.exists(aid, path).await {
+            Ok(exists) => exists,
+            Err(error) => {
+                log_filesystem_host_error("exists", &error);
+                false
+            }
+        }
+    }
+
+    async fn size(&self, aid: &str, path: &str) -> Option<usize> {
+        match self.host.size(aid, path).await {
+            Ok(size) => size,
+            Err(error) => {
+                log_filesystem_host_error("size", &error);
+                None
+            }
+        }
+    }
+
+    async fn read(&self, aid: &str, path: &str, offset: usize, count: usize, buf: &mut [u8]) -> Option<usize> {
+        match self.host.read(aid, path, offset, count, buf).await {
+            Ok(Some(read)) if read <= count && read <= buf.len() => Some(read),
+            Ok(Some(read)) => {
+                tracing::warn!(
+                    target: "m32::storage",
+                    event = "wie_filesystem_invalid_read_count",
+                    returned_count = read,
+                    requested_count = count,
+                    buffer_len = buf.len(),
+                    "M32 filesystem host returned an invalid WIE read count"
+                );
+                None
+            }
+            Ok(None) => None,
+            Err(error) => {
+                log_filesystem_host_error("read", &error);
+                None
+            }
+        }
+    }
+
+    async fn write(&self, aid: &str, path: &str, offset: usize, data: &[u8]) -> usize {
+        match self.host.write(aid, path, offset, data).await {
+            Ok(written) if written == data.len() => written,
+            Ok(written) => {
+                tracing::warn!(
+                    target: "m32::storage",
+                    event = "wie_filesystem_invalid_write_count",
+                    returned_count = written,
+                    requested_count = data.len(),
+                    "M32 filesystem host returned a partial/invalid WIE write count"
+                );
+                0
+            }
+            Err(error) => {
+                log_filesystem_host_error("write", &error);
+                0
+            }
+        }
+    }
+
+    async fn truncate(&self, aid: &str, path: &str, len: usize) {
+        if let Err(error) = self.host.truncate(aid, path, len).await {
+            log_filesystem_host_error("truncate", &error);
+        }
+    }
+}
+
+fn log_filesystem_host_error(operation: &'static str, error: &GuestFilesystemError) {
+    tracing::warn!(
+        target: "m32::storage",
+        event = "wie_filesystem_host_failed",
+        operation,
+        error_code = ?error.code,
+        "M32 guest filesystem host operation failed"
+    );
 }
 
 pub struct WieScreenAdapter {
@@ -400,6 +492,374 @@ mod tests {
         assert_eq!(
             *vibration.last.lock().expect("vibration mutex poisoned"),
             Some((900, 170))
+        );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedWrite {
+        aid: String,
+        path: String,
+        offset: usize,
+        data: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedTruncate {
+        aid: String,
+        path: String,
+        len: usize,
+    }
+
+    #[derive(Default)]
+    struct RecordingFilesystemHost {
+        calls: Mutex<Vec<String>>,
+        write: Mutex<Option<RecordedWrite>>,
+        truncate: Mutex<Option<RecordedTruncate>>,
+    }
+
+    impl GuestFilesystemHost for RecordingFilesystemHost {
+        fn exists<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestFilesystemError>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("filesystem calls mutex poisoned")
+                    .push(format!("exists:{aid}:{path}"));
+                Ok(path == "save/state.bin")
+            })
+        }
+
+        fn size<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("filesystem calls mutex poisoned")
+                    .push(format!("size:{aid}:{path}"));
+                Ok(Some(6))
+            })
+        }
+
+        fn read<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+            offset: usize,
+            count: usize,
+            buf: &'a mut [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("filesystem calls mutex poisoned")
+                    .push(format!("read:{aid}:{path}:{offset}:{count}"));
+
+                let source = b"abcdef";
+                if offset >= source.len() {
+                    return Ok(Some(0));
+                }
+
+                let read = count.min(source.len() - offset);
+                buf[..read].copy_from_slice(&source[offset..offset + read]);
+                Ok(Some(read))
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+            offset: usize,
+            data: &'a [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<usize, GuestFilesystemError>> {
+            Box::pin(async move {
+                *self.write.lock().expect("filesystem write mutex poisoned") = Some(RecordedWrite {
+                    aid: aid.to_owned(),
+                    path: path.to_owned(),
+                    offset,
+                    data: data.to_vec(),
+                });
+                Ok(data.len())
+            })
+        }
+
+        fn truncate<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+            len: usize,
+        ) -> m32_emulator_api::HostFuture<'a, Result<(), GuestFilesystemError>> {
+            Box::pin(async move {
+                *self.truncate.lock().expect("filesystem truncate mutex poisoned") = Some(RecordedTruncate {
+                    aid: aid.to_owned(),
+                    path: path.to_owned(),
+                    len,
+                });
+                Ok(())
+            })
+        }
+    }
+
+    struct FailingFilesystemHost;
+
+    impl GuestFilesystemHost for FailingFilesystemHost {
+        fn exists<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestFilesystemError>> {
+            Box::pin(async { Err(GuestFilesystemError::operation_failed("exists failure")) })
+        }
+
+        fn size<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async { Err(GuestFilesystemError::operation_failed("size failure")) })
+        }
+
+        fn read<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+            _offset: usize,
+            _count: usize,
+            _buf: &'a mut [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async { Err(GuestFilesystemError::operation_failed("read failure")) })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+            _offset: usize,
+            _data: &'a [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<usize, GuestFilesystemError>> {
+            Box::pin(async { Err(GuestFilesystemError::operation_failed("write failure")) })
+        }
+
+        fn truncate<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+            _len: usize,
+        ) -> m32_emulator_api::HostFuture<'a, Result<(), GuestFilesystemError>> {
+            Box::pin(async { Err(GuestFilesystemError::operation_failed("truncate failure")) })
+        }
+    }
+
+    struct InvalidCountFilesystemHost;
+
+    impl GuestFilesystemHost for InvalidCountFilesystemHost {
+        fn exists<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestFilesystemError>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn size<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn read<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+            _offset: usize,
+            count: usize,
+            _buf: &'a mut [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async move { Ok(Some(count + 1)) })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+            _offset: usize,
+            data: &'a [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<usize, GuestFilesystemError>> {
+            Box::pin(async move { Ok(data.len().saturating_sub(1)) })
+        }
+
+        fn truncate<'a>(
+            &'a self,
+            _aid: &'a str,
+            _path: &'a str,
+            _len: usize,
+        ) -> m32_emulator_api::HostFuture<'a, Result<(), GuestFilesystemError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn block_on_ready<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(Waker::noop());
+
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn wie_filesystem_adapter_implements_pinned_filesystem_contract() {
+        fn assert_filesystem<T: wie_backend::Filesystem>() {}
+
+        assert_filesystem::<WieFilesystemAdapter>();
+    }
+
+    #[test]
+    fn wie_filesystem_exists_and_size_preserve_aid_and_path() {
+        let host = Arc::new(RecordingFilesystemHost::default());
+        let filesystem = WieFilesystemAdapter::new(host.clone());
+
+        assert!(block_on_ready(wie_backend::Filesystem::exists(
+            &filesystem,
+            "game.aid",
+            "save/state.bin"
+        )));
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::size(&filesystem, "game.aid", "save/state.bin")),
+            Some(6)
+        );
+
+        assert_eq!(
+            *host.calls.lock().expect("filesystem calls mutex poisoned"),
+            vec!["exists:game.aid:save/state.bin", "size:game.aid:save/state.bin"]
+        );
+    }
+
+    #[test]
+    fn wie_filesystem_read_preserves_offset_count_and_buffer_result() {
+        let host = Arc::new(RecordingFilesystemHost::default());
+        let filesystem = WieFilesystemAdapter::new(host);
+
+        let mut buffer = [0_u8; 4];
+        let read = block_on_ready(wie_backend::Filesystem::read(
+            &filesystem,
+            "game.aid",
+            "save/state.bin",
+            2,
+            3,
+            &mut buffer,
+        ));
+
+        assert_eq!(read, Some(3));
+        assert_eq!(&buffer[..3], b"cde");
+    }
+
+    #[test]
+    fn wie_filesystem_write_and_truncate_preserve_request_values() {
+        let host = Arc::new(RecordingFilesystemHost::default());
+        let filesystem = WieFilesystemAdapter::new(host.clone());
+
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::write(
+                &filesystem,
+                "game.aid",
+                "save/state.bin",
+                7,
+                &[1, 2, 3],
+            )),
+            3
+        );
+        block_on_ready(wie_backend::Filesystem::truncate(
+            &filesystem,
+            "game.aid",
+            "save/state.bin",
+            9,
+        ));
+
+        assert_eq!(
+            *host.write.lock().expect("filesystem write mutex poisoned"),
+            Some(RecordedWrite {
+                aid: "game.aid".to_owned(),
+                path: "save/state.bin".to_owned(),
+                offset: 7,
+                data: vec![1, 2, 3],
+            })
+        );
+        assert_eq!(
+            *host.truncate.lock().expect("filesystem truncate mutex poisoned"),
+            Some(RecordedTruncate {
+                aid: "game.aid".to_owned(),
+                path: "save/state.bin".to_owned(),
+                len: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn wie_filesystem_host_errors_map_to_wie_fallback_values() {
+        let filesystem = WieFilesystemAdapter::new(Arc::new(FailingFilesystemHost));
+        let mut buffer = [0_u8; 4];
+
+        assert!(!block_on_ready(wie_backend::Filesystem::exists(
+            &filesystem,
+            "aid",
+            "file"
+        )));
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::size(&filesystem, "aid", "file")),
+            None
+        );
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::read(
+                &filesystem,
+                "aid",
+                "file",
+                0,
+                4,
+                &mut buffer
+            )),
+            None
+        );
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::write(&filesystem, "aid", "file", 0, &[1, 2])),
+            0
+        );
+
+        block_on_ready(wie_backend::Filesystem::truncate(&filesystem, "aid", "file", 0));
+    }
+
+    #[test]
+    fn wie_filesystem_rejects_invalid_host_read_and_write_counts() {
+        let filesystem = WieFilesystemAdapter::new(Arc::new(InvalidCountFilesystemHost));
+        let mut buffer = [0_u8; 2];
+
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::read(
+                &filesystem,
+                "aid",
+                "file",
+                0,
+                2,
+                &mut buffer
+            )),
+            None
+        );
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::write(&filesystem, "aid", "file", 0, &[1, 2])),
+            0
         );
     }
 

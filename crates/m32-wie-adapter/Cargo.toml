@@ -8,6 +8,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+async-trait.workspace = true
 m32-emulator-api = { path = "../m32-emulator-api" }
 tracing.workspace = true
 wie_backend.workspace = true

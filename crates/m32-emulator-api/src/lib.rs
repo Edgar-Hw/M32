@@ -3,7 +3,7 @@
 //! This crate must remain independent from any concrete emulator implementation.
 //! WIE-specific types belong behind `m32-wie-adapter`.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, future::Future, pin::Pin};
 
 pub const EMULATOR_API_SCHEMA_VERSION: u32 = 1;
 
@@ -197,6 +197,67 @@ pub trait VibrationHost: Send + Sync {
     fn vibrate(&self, duration_ms: u64, intensity: u8);
 }
 
+pub type HostFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuestFilesystemErrorCode {
+    OperationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestFilesystemError {
+    pub code: GuestFilesystemErrorCode,
+    pub message: String,
+}
+
+impl GuestFilesystemError {
+    #[must_use]
+    pub fn operation_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: GuestFilesystemErrorCode::OperationFailed,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for GuestFilesystemError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl Error for GuestFilesystemError {}
+
+pub trait GuestFilesystemHost: Send + Sync {
+    fn exists<'a>(&'a self, aid: &'a str, path: &'a str) -> HostFuture<'a, Result<bool, GuestFilesystemError>>;
+
+    fn size<'a>(&'a self, aid: &'a str, path: &'a str) -> HostFuture<'a, Result<Option<usize>, GuestFilesystemError>>;
+
+    fn read<'a>(
+        &'a self,
+        aid: &'a str,
+        path: &'a str,
+        offset: usize,
+        count: usize,
+        buf: &'a mut [u8],
+    ) -> HostFuture<'a, Result<Option<usize>, GuestFilesystemError>>;
+
+    fn write<'a>(
+        &'a self,
+        aid: &'a str,
+        path: &'a str,
+        offset: usize,
+        data: &'a [u8],
+    ) -> HostFuture<'a, Result<usize, GuestFilesystemError>>;
+
+    fn truncate<'a>(
+        &'a self,
+        aid: &'a str,
+        path: &'a str,
+        len: usize,
+    ) -> HostFuture<'a, Result<(), GuestFilesystemError>>;
+}
+
 pub trait EmulatorBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
     fn required_host_services(&self) -> &'static [HostServiceKind];
@@ -331,6 +392,92 @@ mod tests {
     impl VibrationHost for SyntheticVibration {
         fn vibrate(&self, duration_ms: u64, intensity: u8) {
             *self.last.lock().expect("vibration mutex poisoned") = Some((duration_ms, intensity));
+        }
+    }
+
+    struct SyntheticFilesystem;
+
+    impl GuestFilesystemHost for SyntheticFilesystem {
+        fn exists<'a>(&'a self, aid: &'a str, path: &'a str) -> HostFuture<'a, Result<bool, GuestFilesystemError>> {
+            Box::pin(async move {
+                assert_eq!(aid, "app-1");
+                assert_eq!(path, "save/state.bin");
+                Ok(true)
+            })
+        }
+
+        fn size<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+        ) -> HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async move {
+                assert_eq!(aid, "app-1");
+                assert_eq!(path, "save/state.bin");
+                Ok(Some(4))
+            })
+        }
+
+        fn read<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+            offset: usize,
+            count: usize,
+            buf: &'a mut [u8],
+        ) -> HostFuture<'a, Result<Option<usize>, GuestFilesystemError>> {
+            Box::pin(async move {
+                assert_eq!(aid, "app-1");
+                assert_eq!(path, "save/state.bin");
+                assert_eq!(offset, 1);
+                assert_eq!(count, 2);
+                buf[..2].copy_from_slice(&[0x22, 0x33]);
+                Ok(Some(2))
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+            offset: usize,
+            data: &'a [u8],
+        ) -> HostFuture<'a, Result<usize, GuestFilesystemError>> {
+            Box::pin(async move {
+                assert_eq!(aid, "app-1");
+                assert_eq!(path, "save/state.bin");
+                assert_eq!(offset, 4);
+                assert_eq!(data, &[0x44, 0x55]);
+                Ok(data.len())
+            })
+        }
+
+        fn truncate<'a>(
+            &'a self,
+            aid: &'a str,
+            path: &'a str,
+            len: usize,
+        ) -> HostFuture<'a, Result<(), GuestFilesystemError>> {
+            Box::pin(async move {
+                assert_eq!(aid, "app-1");
+                assert_eq!(path, "save/state.bin");
+                assert_eq!(len, 3);
+                Ok(())
+            })
+        }
+    }
+
+    fn poll_ready<F: Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(Waker::noop());
+
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
         }
     }
 
@@ -476,6 +623,40 @@ mod tests {
             *vibration.last.lock().expect("vibration mutex poisoned"),
             Some((1_250, 200))
         );
+    }
+
+    #[test]
+    fn guest_filesystem_error_keeps_stable_code_and_message() {
+        let error = GuestFilesystemError::operation_failed("synthetic filesystem failure");
+
+        assert_eq!(error.code, GuestFilesystemErrorCode::OperationFailed);
+        assert_eq!(error.message, "synthetic filesystem failure");
+        assert!(error.to_string().contains("OperationFailed"));
+    }
+
+    #[test]
+    fn guest_filesystem_contract_preserves_aid_path_offsets_and_bytes() {
+        let filesystem: &dyn GuestFilesystemHost = &SyntheticFilesystem;
+
+        assert!(poll_ready(filesystem.exists("app-1", "save/state.bin")).expect("exists must succeed"));
+        assert_eq!(
+            poll_ready(filesystem.size("app-1", "save/state.bin")).expect("size must succeed"),
+            Some(4)
+        );
+
+        let mut buffer = [0_u8; 4];
+        assert_eq!(
+            poll_ready(filesystem.read("app-1", "save/state.bin", 1, 2, &mut buffer)).expect("read must succeed"),
+            Some(2)
+        );
+        assert_eq!(&buffer[..2], &[0x22, 0x33]);
+
+        assert_eq!(
+            poll_ready(filesystem.write("app-1", "save/state.bin", 4, &[0x44, 0x55])).expect("write must succeed"),
+            2
+        );
+
+        poll_ready(filesystem.truncate("app-1", "save/state.bin", 3)).expect("truncate must succeed");
     }
 
     #[test]
