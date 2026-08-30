@@ -7,10 +7,10 @@ use std::{fmt::Display, sync::Arc};
 
 use m32_emulator_api::{
     BackendDescriptor, ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
-    EmulatorSessionError, ExitHost, GuestAudioCommand, GuestAudioEventData, GuestAudioHost, GuestAudioHostError,
-    GuestAudioSequence, GuestDatabaseError, GuestDatabaseHost, GuestDatabaseRepositoryHost, GuestFilesystemError,
-    GuestFilesystemHost, GuestOutputHost, GuestTimedAudioEvent, HostServiceKind, RgbaFrame, SessionErrorCode,
-    SessionState, VibrationHost,
+    EmulatorSessionCreateError, EmulatorSessionError, ExitHost, GuestAudioCommand, GuestAudioEventData, GuestAudioHost,
+    GuestAudioHostError, GuestAudioSequence, GuestDatabaseError, GuestDatabaseHost, GuestDatabaseRepositoryHost,
+    GuestFilesystemError, GuestFilesystemHost, GuestOutputHost, GuestTimedAudioEvent, HostServiceKind, RgbaFrame,
+    SessionCreateErrorCode, SessionErrorCode, SessionState, VibrationHost,
 };
 use wie_util::WieError;
 
@@ -163,6 +163,25 @@ impl wie_backend::Platform for WiePlatformAdapter {
     fn vibrate(&self, duration_ms: u64, intensity: u8) {
         self.basic.vibrate(duration_ms, intensity);
     }
+}
+
+pub fn create_j2me_jar_session(
+    hosts: WiePlatformHosts,
+    jar_filename: &str,
+    jar: Vec<u8>,
+) -> Result<Box<dyn EmulatorSession>, EmulatorSessionCreateError> {
+    let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+    let emulator = wie_j2me::J2MEEmulator::from_jar(platform, jar_filename, jar).map_err(map_session_create_error)?;
+
+    Ok(Box::new(WieSession {
+        emulator: Box::new(emulator),
+        state: SessionState::Ready,
+    }))
+}
+
+fn map_session_create_error(error: impl Display) -> EmulatorSessionCreateError {
+    EmulatorSessionCreateError::new(SessionCreateErrorCode::BackendLaunchFailed, error.to_string())
 }
 
 pub struct WieAudioSinkAdapter {
@@ -1764,6 +1783,43 @@ mod tests {
                 GuestAudioCommand::Stop { handle: 12 },
             ]
         );
+    }
+
+    fn recording_platform_hosts() -> WiePlatformHosts {
+        WiePlatformHosts {
+            display: Arc::new(RecordingDisplayHost::default()),
+            clock: Arc::new(FixedClock(1_725_123_456_789)),
+            database: Arc::new(RecordingDatabaseRepository::default()),
+            filesystem: Arc::new(RecordingFilesystemHost::default()),
+            audio: Arc::new(RecordingAudioHost::default()),
+            output: Arc::new(RecordingOutput::default()),
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        }
+    }
+
+    #[test]
+    fn pinned_j2me_emulator_implements_wie_emulator_contract() {
+        fn assert_emulator<T: wie_backend::Emulator>() {}
+
+        assert_emulator::<wie_j2me::J2MEEmulator>();
+    }
+
+    #[test]
+    fn j2me_jar_factory_constructs_ready_m32_session() {
+        let session = create_j2me_jar_session(recording_platform_hosts(), "synthetic-empty.jar", Vec::new())
+            .expect("pinned J2ME constructor must accept ownership of platform and JAR bytes");
+
+        assert_eq!(session.backend(), wie_backend_descriptor());
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    #[test]
+    fn session_create_error_maps_to_stable_m32_code() {
+        let error = map_session_create_error("synthetic constructor failure");
+
+        assert_eq!(error.code, SessionCreateErrorCode::BackendLaunchFailed);
+        assert_eq!(error.message, "synthetic constructor failure");
     }
 
     #[test]

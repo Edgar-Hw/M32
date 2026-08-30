@@ -16,6 +16,7 @@ members = [
     "crates/m32-timeline",
     "crates/m32-test-fixtures",
 ]
+exclude = ["third_party/rustjava"]
 
 [workspace.package]
 version = "0.0.0"
@@ -26,6 +27,7 @@ async-trait = "=0.1.92"
 tracing = "=0.1.41"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
 wie_backend = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_backend" }
+wie_j2me = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_j2me" }
 wie_util = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_util" }
 
 [workspace.metadata.m32.quality]
@@ -43,6 +45,12 @@ repository = "https://github.com/dlunch/smaf.git"
 revision = "8009d78512fd121609a841f31aa527bf2a4af456"
 mode = "vendored-path-patch"
 
+[workspace.metadata.m32.upstream.rustjava]
+repository = "https://github.com/dlunch/RustJava.git"
+revision = "ba5797b8eb4cf376fdd63129903d319d1d7acf98"
+mode = "vendored-path-patch"
+source = "pinned-wie-cargo-lock"
+
 [profile.bench]
 inherits = "release"
 debug = 1
@@ -53,3 +61,11 @@ incremental = false
 [patch."https://github.com/dlunch/smaf.git"]
 smaf = { path = "third_party/smaf/smaf" }
 smaf_player = { path = "third_party/smaf/smaf_player" }
+
+[patch."https://github.com/dlunch/RustJava.git"]
+classfile = { path = "third_party/rustjava/classfile" }
+java_class_proto = { path = "third_party/rustjava/java_class_proto" }
+java_constants = { path = "third_party/rustjava/java_constants" }
+java_runtime = { path = "third_party/rustjava/java_runtime" }
+jvm = { path = "third_party/rustjava/jvm" }
+jvm_rust = { path = "third_party/rustjava/jvm_rust" }

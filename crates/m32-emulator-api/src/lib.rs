@@ -396,6 +396,35 @@ pub trait EmulatorBackend: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionCreateErrorCode {
+    BackendLaunchFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmulatorSessionCreateError {
+    pub code: SessionCreateErrorCode,
+    pub message: String,
+}
+
+impl EmulatorSessionCreateError {
+    #[must_use]
+    pub fn new(code: SessionCreateErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for EmulatorSessionCreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl Error for EmulatorSessionCreateError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionState {
     Ready,
     Running,
@@ -1038,6 +1067,23 @@ mod tests {
         assert_eq!(error.code, GuestAudioHostErrorCode::DispatchFailed);
         assert_eq!(error.message, "synthetic audio failure");
         assert!(error.to_string().contains("DispatchFailed"));
+    }
+
+    #[test]
+    fn session_create_error_keeps_stable_code_and_message() {
+        let error =
+            EmulatorSessionCreateError::new(SessionCreateErrorCode::BackendLaunchFailed, "synthetic launch failure");
+
+        assert_eq!(error.code, SessionCreateErrorCode::BackendLaunchFailed);
+        assert_eq!(error.message, "synthetic launch failure");
+        assert!(error.to_string().contains("BackendLaunchFailed"));
+    }
+
+    #[test]
+    fn session_create_error_implements_std_error_contract() {
+        fn assert_error<T: std::error::Error>() {}
+
+        assert_error::<EmulatorSessionCreateError>();
     }
 
     #[test]

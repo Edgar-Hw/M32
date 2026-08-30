@@ -12,4 +12,5 @@ async-trait.workspace = true
 m32-emulator-api = { path = "../m32-emulator-api" }
 tracing.workspace = true
 wie_backend.workspace = true
+wie_j2me.workspace = true
 wie_util.workspace = true
