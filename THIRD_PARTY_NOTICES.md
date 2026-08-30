@@ -1,6 +1,6 @@
 # M32 Third-Party Notices
 
-Last reviewed for Task: `0.0.1-T009`
+Last reviewed for Task: `0.0.2-T001`
 
 This file records third-party software that M32 uses, bundles, or has reserved
 as an explicitly planned upstream dependency in the locked implementation plan.
@@ -13,12 +13,14 @@ code is already linked into the current M32 build.
 ### tracing
 
 - Project: tracing
-- Version: 0.1.44
+- Version: 0.1.41
 - Upstream: https://github.com/tokio-rs/tracing
 - Purpose in M32: structured application diagnostics and events
 - License: MIT
 - Copyright: Copyright (c) 2019 Tokio Contributors
 - Current status: linked by `m32-desktop`
+- Compatibility note: pinned to 0.1.41 so the M32 workspace can coexist with the
+  pinned WIE `wie_util` requirement `tracing-attributes <0.1.29`
 
 ### tracing-subscriber
 
@@ -44,8 +46,7 @@ be updated in the same Task or dependency-change commit.
 ## 2. Reserved upstream notices for the locked emulator plan
 
 The following projects are listed now because the M32 locked architecture
-explicitly plans to consume them in later Tasks. They are **not yet linked in
-the T009 build**.
+contains components whose integration status is recorded individually below.
 
 ### WIE
 
@@ -56,11 +57,27 @@ the T009 build**.
   `f0513eb758c02736981f545ad030eed937d55f3e`
 - License: MIT
 - Copyright: Copyright 2020 Inseok Lee
-- Current T009 status: planned / not yet linked
+- Current 0.0.2-T001 status: `wie_backend` is a pinned compile dependency of `m32-wie-adapter`; WIE is not yet wired into the `m32-desktop` runtime
 
 MIT permission and warranty terms are provided by the upstream project's
 LICENSE and must be preserved in M32 distributions that include substantial
 portions of WIE.
+
+
+### SMAF / smaf_player
+
+- Project: SMAF
+- Upstream: https://github.com/dlunch/smaf
+- Revision: `8009d78512fd121609a841f31aa527bf2a4af456`
+- Components used: `smaf`, `smaf_player`
+- Purpose in M32: transitive SMAF parsing/playback dependency required by the pinned WIE backend
+- License: MIT
+- Copyright: Copyright 2020 Inseok Lee
+- Distribution form: minimal vendored source under `third_party/smaf`
+- Current 0.0.2-T001 status: linked transitively through `wie_backend`
+
+This revision is the SMAF revision recorded by the pinned WIE `Cargo.lock`. M32 vendors only the
+library package sources required for the WIE backend and preserves the upstream MIT license.
 
 ### RustJava
 
@@ -70,7 +87,7 @@ portions of WIE.
   planned WIE integration
 - License: MIT
 - Copyright: Copyright 2020 Inseok Lee
-- Current T009 status: planned / not yet linked
+- Current 0.0.2-T001 status: planned / not yet linked
 
 MIT permission and warranty terms are provided by the upstream project's
 LICENSE and must be preserved in M32 distributions that include substantial
@@ -78,7 +95,7 @@ portions of RustJava.
 
 ## 3. Components not yet selected
 
-The following categories deliberately have no final component selected at T009:
+The following categories deliberately have no final component selected at 0.0.2-T001:
 
 - M32 UI fonts
 - MIDI software synthesizer

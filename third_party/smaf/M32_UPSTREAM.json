@@ -1,0 +1,12 @@
+﻿{
+    "schema_version":  1,
+    "repository":  "https://github.com/dlunch/smaf.git",
+    "revision":  "8009d78512fd121609a841f31aa527bf2a4af456",
+    "components":  [
+                       "smaf",
+                       "smaf_player"
+                   ],
+    "license":  "MIT",
+    "copyright":  "Copyright 2020 Inseok Lee",
+    "vendoring_reason":  "Reproduce the SMAF revision recorded by the pinned WIE Cargo.lock."
+}

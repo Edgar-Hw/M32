@@ -22,13 +22,24 @@ version = "0.0.0"
 edition = "2024"
 
 [workspace.dependencies]
-tracing = "=0.1.44"
+tracing = "=0.1.41"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+wie_backend = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_backend" }
 
 [workspace.metadata.m32.quality]
 fmt = "cargo fmt --all -- --check"
 clippy = "cargo clippy --workspace --all-targets -- -D warnings"
 test = "cargo test --workspace"
+
+[workspace.metadata.m32.upstream.wie]
+repository = "https://github.com/dlunch/wie.git"
+revision = "f0513eb758c02736981f545ad030eed937d55f3e"
+crate = "wie_backend"
+
+[workspace.metadata.m32.upstream.smaf]
+repository = "https://github.com/dlunch/smaf.git"
+revision = "8009d78512fd121609a841f31aa527bf2a4af456"
+mode = "vendored-path-patch"
 
 [profile.bench]
 inherits = "release"
@@ -36,3 +47,7 @@ debug = 1
 lto = "thin"
 codegen-units = 1
 incremental = false
+
+[patch."https://github.com/dlunch/smaf.git"]
+smaf = { path = "third_party/smaf/smaf" }
+smaf_player = { path = "third_party/smaf/smaf_player" }
