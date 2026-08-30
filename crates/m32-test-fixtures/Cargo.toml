@@ -6,3 +6,8 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[[bench]]
+name = "foundation_baseline"
+path = "benches/foundation_baseline.rs"
+harness = false
