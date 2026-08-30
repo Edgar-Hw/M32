@@ -6,8 +6,9 @@
 use std::{fmt::Display, sync::Arc};
 
 use m32_emulator_api::{
-    BackendDescriptor, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
-    EmulatorSessionError, HostServiceKind, RgbaFrame, SessionErrorCode, SessionState,
+    BackendDescriptor, ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
+    EmulatorSessionError, ExitHost, GuestOutputHost, HostServiceKind, RgbaFrame, SessionErrorCode, SessionState,
+    VibrationHost,
 };
 use wie_util::WieError;
 
@@ -45,6 +46,50 @@ impl EmulatorBackend for WieBackendAdapter {
 
     fn required_host_services(&self) -> &'static [HostServiceKind] {
         WIE_REQUIRED_HOST_SERVICES
+    }
+}
+
+pub struct WieBasicHostBridge {
+    clock: Arc<dyn ClockHost>,
+    output: Arc<dyn GuestOutputHost>,
+    exit: Arc<dyn ExitHost>,
+    vibration: Arc<dyn VibrationHost>,
+}
+
+impl WieBasicHostBridge {
+    pub fn new(
+        clock: Arc<dyn ClockHost>,
+        output: Arc<dyn GuestOutputHost>,
+        exit: Arc<dyn ExitHost>,
+        vibration: Arc<dyn VibrationHost>,
+    ) -> Self {
+        Self {
+            clock,
+            output,
+            exit,
+            vibration,
+        }
+    }
+
+    #[must_use]
+    pub fn epoch_millis(&self) -> u64 {
+        self.clock.epoch_millis()
+    }
+
+    pub fn write_stdout(&self, bytes: &[u8]) {
+        self.output.write_stdout(bytes);
+    }
+
+    pub fn write_stderr(&self, bytes: &[u8]) {
+        self.output.write_stderr(bytes);
+    }
+
+    pub fn request_exit(&self) {
+        self.exit.request_exit();
+    }
+
+    pub fn vibrate(&self, duration_ms: u64, intensity: u8) {
+        self.vibration.vibrate(duration_ms, intensity);
     }
 }
 
@@ -238,6 +283,124 @@ mod tests {
         fn colors(&self) -> Vec<Color> {
             vec![self.get_pixel(0, 0), self.get_pixel(1, 0)]
         }
+    }
+
+    struct FixedClock(u64);
+
+    impl ClockHost for FixedClock {
+        fn epoch_millis(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingOutput {
+        stdout: Mutex<Vec<u8>>,
+        stderr: Mutex<Vec<u8>>,
+    }
+
+    impl GuestOutputHost for RecordingOutput {
+        fn write_stdout(&self, bytes: &[u8]) {
+            self.stdout
+                .lock()
+                .expect("stdout mutex poisoned")
+                .extend_from_slice(bytes);
+        }
+
+        fn write_stderr(&self, bytes: &[u8]) {
+            self.stderr
+                .lock()
+                .expect("stderr mutex poisoned")
+                .extend_from_slice(bytes);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingExit {
+        count: Mutex<u32>,
+    }
+
+    impl ExitHost for RecordingExit {
+        fn request_exit(&self) {
+            let mut count = self.count.lock().expect("exit mutex poisoned");
+            *count += 1;
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingVibration {
+        last: Mutex<Option<(u64, u8)>>,
+    }
+
+    impl VibrationHost for RecordingVibration {
+        fn vibrate(&self, duration_ms: u64, intensity: u8) {
+            *self.last.lock().expect("vibration mutex poisoned") = Some((duration_ms, intensity));
+        }
+    }
+
+    fn recording_basic_bridge(
+        epoch_millis: u64,
+    ) -> (
+        WieBasicHostBridge,
+        Arc<RecordingOutput>,
+        Arc<RecordingExit>,
+        Arc<RecordingVibration>,
+    ) {
+        let output = Arc::new(RecordingOutput::default());
+        let exit = Arc::new(RecordingExit::default());
+        let vibration = Arc::new(RecordingVibration::default());
+
+        let bridge = WieBasicHostBridge::new(
+            Arc::new(FixedClock(epoch_millis)),
+            output.clone(),
+            exit.clone(),
+            vibration.clone(),
+        );
+
+        (bridge, output, exit, vibration)
+    }
+
+    #[test]
+    fn basic_host_bridge_maps_epoch_millis_to_wie_instant() {
+        let (bridge, _, _, _) = recording_basic_bridge(1_725_000_123_456);
+        let instant = wie_backend::Instant::from_epoch_millis(bridge.epoch_millis());
+
+        assert_eq!(instant.raw(), 1_725_000_123_456);
+    }
+
+    #[test]
+    fn basic_host_bridge_forwards_guest_output_as_raw_bytes() {
+        let (bridge, output, _, _) = recording_basic_bridge(0);
+
+        bridge.write_stdout(&[0x00, 0xFF, b'M']);
+        bridge.write_stderr(&[0x80, b'E']);
+
+        assert_eq!(
+            *output.stdout.lock().expect("stdout mutex poisoned"),
+            vec![0x00, 0xFF, b'M']
+        );
+        assert_eq!(*output.stderr.lock().expect("stderr mutex poisoned"), vec![0x80, b'E']);
+    }
+
+    #[test]
+    fn basic_host_bridge_forwards_guest_exit_request() {
+        let (bridge, _, exit, _) = recording_basic_bridge(0);
+
+        bridge.request_exit();
+
+        assert_eq!(*exit.count.lock().expect("exit mutex poisoned"), 1);
+    }
+
+    #[test]
+    fn basic_host_bridge_forwards_vibration_values() {
+        let (bridge, _, _, vibration) = recording_basic_bridge(0);
+
+        bridge.vibrate(900, 170);
+
+        assert_eq!(
+            *vibration.last.lock().expect("vibration mutex poisoned"),
+            Some((900, 170))
+        );
     }
 
     #[test]

@@ -180,6 +180,23 @@ pub trait DisplayHost: Send + Sync {
     fn size(&self) -> DisplaySize;
 }
 
+pub trait ClockHost: Send + Sync {
+    fn epoch_millis(&self) -> u64;
+}
+
+pub trait GuestOutputHost: Send + Sync {
+    fn write_stdout(&self, bytes: &[u8]);
+    fn write_stderr(&self, bytes: &[u8]);
+}
+
+pub trait ExitHost: Send + Sync {
+    fn request_exit(&self);
+}
+
+pub trait VibrationHost: Send + Sync {
+    fn vibrate(&self, duration_ms: u64, intensity: u8);
+}
+
 pub trait EmulatorBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
     fn required_host_services(&self) -> &'static [HostServiceKind];
@@ -229,6 +246,8 @@ pub trait EmulatorSession {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     struct SyntheticBackend;
@@ -259,6 +278,59 @@ mod tests {
         fn tick(&mut self) -> Result<(), EmulatorSessionError> {
             self.state = SessionState::Running;
             Ok(())
+        }
+    }
+
+    struct SyntheticClock(u64);
+
+    impl ClockHost for SyntheticClock {
+        fn epoch_millis(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[derive(Default)]
+    struct SyntheticOutput {
+        stdout: Mutex<Vec<u8>>,
+        stderr: Mutex<Vec<u8>>,
+    }
+
+    impl GuestOutputHost for SyntheticOutput {
+        fn write_stdout(&self, bytes: &[u8]) {
+            self.stdout
+                .lock()
+                .expect("stdout mutex poisoned")
+                .extend_from_slice(bytes);
+        }
+
+        fn write_stderr(&self, bytes: &[u8]) {
+            self.stderr
+                .lock()
+                .expect("stderr mutex poisoned")
+                .extend_from_slice(bytes);
+        }
+    }
+
+    #[derive(Default)]
+    struct SyntheticExit {
+        requests: Mutex<u32>,
+    }
+
+    impl ExitHost for SyntheticExit {
+        fn request_exit(&self) {
+            let mut requests = self.requests.lock().expect("exit mutex poisoned");
+            *requests += 1;
+        }
+    }
+
+    #[derive(Default)]
+    struct SyntheticVibration {
+        last: Mutex<Option<(u64, u8)>>,
+    }
+
+    impl VibrationHost for SyntheticVibration {
+        fn vibrate(&self, duration_ms: u64, intensity: u8) {
+            *self.last.lock().expect("vibration mutex poisoned") = Some((duration_ms, intensity));
         }
     }
 
@@ -361,6 +433,49 @@ mod tests {
         assert_eq!(error.code, DisplayHostErrorCode::PresentFailed);
         assert_eq!(error.message, "synthetic failure");
         assert!(error.to_string().contains("PresentFailed"));
+    }
+
+    #[test]
+    fn clock_host_preserves_full_epoch_millis() {
+        let clock: &dyn ClockHost = &SyntheticClock(u64::MAX - 7);
+
+        assert_eq!(clock.epoch_millis(), u64::MAX - 7);
+    }
+
+    #[test]
+    fn guest_output_host_preserves_raw_bytes() {
+        let output = SyntheticOutput::default();
+
+        output.write_stdout(&[0x00, 0xFF, b'A']);
+        output.write_stderr(&[0x80, b'B']);
+
+        assert_eq!(
+            *output.stdout.lock().expect("stdout mutex poisoned"),
+            vec![0x00, 0xFF, b'A']
+        );
+        assert_eq!(*output.stderr.lock().expect("stderr mutex poisoned"), vec![0x80, b'B']);
+    }
+
+    #[test]
+    fn exit_host_represents_guest_exit_request() {
+        let exit = SyntheticExit::default();
+
+        exit.request_exit();
+        exit.request_exit();
+
+        assert_eq!(*exit.requests.lock().expect("exit mutex poisoned"), 2);
+    }
+
+    #[test]
+    fn vibration_host_preserves_duration_and_intensity() {
+        let vibration = SyntheticVibration::default();
+
+        vibration.vibrate(1_250, 200);
+
+        assert_eq!(
+            *vibration.last.lock().expect("vibration mutex poisoned"),
+            Some((1_250, 200))
+        );
     }
 
     #[test]
