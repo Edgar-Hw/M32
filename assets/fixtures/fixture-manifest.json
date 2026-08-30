@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "task": "0.0.1-T007",
+  "policy": "docs/test/FIXTURE_POLICY.md",
+  "fixtures": [
+    {
+      "id": "j2me-hello-source",
+      "kind": "j2me-source",
+      "path": "assets/fixtures/j2me/hello/HelloMidlet.java",
+      "license": "MIT",
+      "source": "Self-authored by M32 contributors",
+      "sha256": "c0b2fa997cf71f71f524f61a3e952933028917736402673b5f4e9d3193a09c9c",
+      "purpose": "Future J2ME boot/display fixture source; verifies a minimal MIDlet can present deterministic text.",
+      "redistribution_status": "redistributable"
+    },
+    {
+      "id": "j2me-input-source",
+      "kind": "j2me-source",
+      "path": "assets/fixtures/j2me/input/InputMidlet.java",
+      "license": "MIT",
+      "source": "Self-authored by M32 contributors",
+      "sha256": "7e1c85c90e8fe760d2484fc953167cfe77cc51b6b2b85b6d4832338d965367d0",
+      "purpose": "Future J2ME input fixture source; exposes received key codes as deterministic screen text.",
+      "redistribution_status": "redistributable"
+    },
+    {
+      "id": "j2me-audio-source",
+      "kind": "j2me-source",
+      "path": "assets/fixtures/j2me/audio/AudioMidlet.java",
+      "license": "MIT",
+      "source": "Self-authored by M32 contributors",
+      "sha256": "dd36836cfa4c7cda94af4fad45cce3d3650fec56c26f63802cc0b4725e38e8e0",
+      "purpose": "Future J2ME audio fixture source using generated tone data only, with no copyrighted game audio.",
+      "redistribution_status": "redistributable"
+    },
+    {
+      "id": "malformed-truncated-zip",
+      "kind": "malformed-archive",
+      "path": "assets/fixtures/malformed/truncated.zip",
+      "license": "CC0-1.0",
+      "source": "Generated from scratch for M32 parser tests",
+      "sha256": "a791365b06f57ea29be9ecdb98aac1d13e05cf84945ada21802c01af4e5e0233",
+      "purpose": "Ensures ZIP/archive inspection rejects an intentionally truncated local test file.",
+      "redistribution_status": "redistributable"
+    },
+    {
+      "id": "malformed-truncated-class",
+      "kind": "malformed-class",
+      "path": "assets/fixtures/malformed/truncated.class",
+      "license": "CC0-1.0",
+      "source": "Generated from scratch for M32 parser tests",
+      "sha256": "d72eb0684618f0db8ea2ec8353c77006596b376d710f14c74733cdc301d01412",
+      "purpose": "Ensures Java class parsing handles a valid magic prefix followed by truncated data without panic.",
+      "redistribution_status": "redistributable"
+    },
+    {
+      "id": "malformed-truncated-png",
+      "kind": "malformed-image",
+      "path": "assets/fixtures/malformed/truncated.png",
+      "license": "CC0-1.0",
+      "source": "Generated from scratch for M32 parser tests",
+      "sha256": "d18829309bd00f916182aeea7a90e978fdfd56b79fb2e7abe19d70b90b17f293",
+      "purpose": "Ensures image metadata/preview paths reject an intentionally truncated PNG without panic.",
+      "redistribution_status": "redistributable"
+    }
+  ]
+}
