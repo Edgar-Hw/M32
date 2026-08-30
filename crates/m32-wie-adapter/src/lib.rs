@@ -7,8 +7,9 @@ use std::{fmt::Display, sync::Arc};
 
 use m32_emulator_api::{
     BackendDescriptor, ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
-    EmulatorSessionError, ExitHost, GuestDatabaseError, GuestDatabaseHost, GuestDatabaseRepositoryHost,
-    GuestFilesystemError, GuestFilesystemHost, GuestOutputHost, HostServiceKind, RgbaFrame, SessionErrorCode,
+    EmulatorSessionError, ExitHost, GuestAudioCommand, GuestAudioEventData, GuestAudioHost, GuestAudioHostError,
+    GuestAudioSequence, GuestDatabaseError, GuestDatabaseHost, GuestDatabaseRepositoryHost, GuestFilesystemError,
+    GuestFilesystemHost, GuestOutputHost, GuestTimedAudioEvent, HostServiceKind, RgbaFrame, SessionErrorCode,
     SessionState, VibrationHost,
 };
 use wie_util::WieError;
@@ -92,6 +93,76 @@ impl WieBasicHostBridge {
     pub fn vibrate(&self, duration_ms: u64, intensity: u8) {
         self.vibration.vibrate(duration_ms, intensity);
     }
+}
+
+pub struct WieAudioSinkAdapter {
+    host: Arc<dyn GuestAudioHost>,
+}
+
+impl WieAudioSinkAdapter {
+    #[must_use]
+    pub fn new(host: Arc<dyn GuestAudioHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl wie_backend::AudioSink for WieAudioSinkAdapter {
+    fn send(&self, command: wie_backend::AudioCommand) {
+        let command = map_wie_audio_command(command);
+
+        if let Err(error) = self.host.dispatch(command) {
+            log_audio_host_error(&error);
+        }
+    }
+}
+
+fn map_wie_audio_command(command: wie_backend::AudioCommand) -> GuestAudioCommand {
+    match command {
+        wie_backend::AudioCommand::Play {
+            handle,
+            sequence,
+            repeat,
+        } => GuestAudioCommand::Play {
+            handle,
+            sequence: map_wie_audio_sequence(sequence.as_ref()),
+            repeat,
+        },
+        wie_backend::AudioCommand::Stop { handle } => GuestAudioCommand::Stop { handle },
+    }
+}
+
+fn map_wie_audio_sequence(sequence: &wie_backend::AudioSequence) -> GuestAudioSequence {
+    GuestAudioSequence {
+        duration: sequence.duration,
+        events: sequence.events.iter().map(map_wie_timed_audio_event).collect(),
+    }
+}
+
+fn map_wie_timed_audio_event(event: &wie_backend::TimedAudioEvent) -> GuestTimedAudioEvent {
+    GuestTimedAudioEvent {
+        time: event.time,
+        data: match &event.data {
+            wie_backend::AudioEventData::Midi(bytes) => GuestAudioEventData::Midi(bytes.clone()),
+            wie_backend::AudioEventData::Wave {
+                channels,
+                sampling_rate,
+                samples,
+            } => GuestAudioEventData::Wave {
+                channels: *channels,
+                sampling_rate: *sampling_rate,
+                samples: samples.clone(),
+            },
+        },
+    }
+}
+
+fn log_audio_host_error(error: &GuestAudioHostError) {
+    tracing::warn!(
+        target: "m32::audio",
+        event = "wie_audio_host_failed",
+        error_code = ?error.code,
+        "M32 guest audio host rejected a WIE audio command"
+    );
 }
 
 pub struct WieDatabaseRepositoryAdapter {
@@ -1354,6 +1425,136 @@ mod tests {
         assert!(!block_on_ready(wie_backend::Database::set(&mut database, 7, &[2])));
         assert!(!block_on_ready(wie_backend::Database::delete(&mut database, 7)));
         assert!(block_on_ready(wie_backend::Database::get_record_ids(&database)).is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingAudioHost {
+        commands: Mutex<Vec<GuestAudioCommand>>,
+    }
+
+    impl GuestAudioHost for RecordingAudioHost {
+        fn dispatch(&self, command: GuestAudioCommand) -> Result<(), GuestAudioHostError> {
+            self.commands
+                .lock()
+                .expect("audio commands mutex poisoned")
+                .push(command);
+            Ok(())
+        }
+    }
+
+    struct FailingAudioHost;
+
+    impl GuestAudioHost for FailingAudioHost {
+        fn dispatch(&self, _command: GuestAudioCommand) -> Result<(), GuestAudioHostError> {
+            Err(GuestAudioHostError::dispatch_failed("synthetic audio dispatch failure"))
+        }
+    }
+
+    #[test]
+    fn wie_audio_sink_adapter_implements_pinned_audio_sink_contract() {
+        fn assert_audio_sink<T: wie_backend::AudioSink>() {}
+
+        assert_audio_sink::<WieAudioSinkAdapter>();
+    }
+
+    #[test]
+    fn wie_audio_play_maps_handle_repeat_duration_and_midi_bytes() {
+        let host = Arc::new(RecordingAudioHost::default());
+        let sink = WieAudioSinkAdapter::new(host.clone());
+
+        wie_backend::AudioSink::send(
+            &sink,
+            wie_backend::AudioCommand::Play {
+                handle: 9,
+                sequence: Arc::new(wie_backend::AudioSequence {
+                    duration: 1_500,
+                    events: vec![wie_backend::TimedAudioEvent {
+                        time: 25,
+                        data: wie_backend::AudioEventData::Midi(vec![0x90, 64, 100]),
+                    }],
+                }),
+                repeat: true,
+            },
+        );
+
+        assert_eq!(
+            *host.commands.lock().expect("audio commands mutex poisoned"),
+            vec![GuestAudioCommand::Play {
+                handle: 9,
+                sequence: GuestAudioSequence {
+                    duration: 1_500,
+                    events: vec![GuestTimedAudioEvent {
+                        time: 25,
+                        data: GuestAudioEventData::Midi(vec![0x90, 64, 100]),
+                    }],
+                },
+                repeat: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn wie_audio_wave_maps_channels_sampling_rate_and_i16_samples() {
+        let host = Arc::new(RecordingAudioHost::default());
+        let sink = WieAudioSinkAdapter::new(host.clone());
+
+        wie_backend::AudioSink::send(
+            &sink,
+            wie_backend::AudioCommand::Play {
+                handle: 10,
+                sequence: Arc::new(wie_backend::AudioSequence {
+                    duration: 300,
+                    events: vec![wie_backend::TimedAudioEvent {
+                        time: 5,
+                        data: wie_backend::AudioEventData::Wave {
+                            channels: 2,
+                            sampling_rate: 22_050,
+                            samples: vec![-100, 0, 100, 200],
+                        },
+                    }],
+                }),
+                repeat: false,
+            },
+        );
+
+        assert_eq!(
+            *host.commands.lock().expect("audio commands mutex poisoned"),
+            vec![GuestAudioCommand::Play {
+                handle: 10,
+                sequence: GuestAudioSequence {
+                    duration: 300,
+                    events: vec![GuestTimedAudioEvent {
+                        time: 5,
+                        data: GuestAudioEventData::Wave {
+                            channels: 2,
+                            sampling_rate: 22_050,
+                            samples: vec![-100, 0, 100, 200],
+                        },
+                    }],
+                },
+                repeat: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn wie_audio_stop_maps_exact_handle() {
+        let host = Arc::new(RecordingAudioHost::default());
+        let sink = WieAudioSinkAdapter::new(host.clone());
+
+        wie_backend::AudioSink::send(&sink, wie_backend::AudioCommand::Stop { handle: 77 });
+
+        assert_eq!(
+            *host.commands.lock().expect("audio commands mutex poisoned"),
+            vec![GuestAudioCommand::Stop { handle: 77 }]
+        );
+    }
+
+    #[test]
+    fn wie_audio_host_failure_is_non_panicking() {
+        let sink = WieAudioSinkAdapter::new(Arc::new(FailingAudioHost));
+
+        wie_backend::AudioSink::send(&sink, wie_backend::AudioCommand::Stop { handle: 1 });
     }
 
     #[test]

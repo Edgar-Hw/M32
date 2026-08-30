@@ -321,6 +321,75 @@ pub trait GuestDatabaseRepositoryHost: Send + Sync {
     fn usage<'a>(&'a self, app_id: &'a str) -> HostFuture<'a, Result<u64, GuestDatabaseError>>;
 }
 
+pub type GuestAudioHandle = u32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestAudioEventData {
+    Midi(Vec<u8>),
+    Wave {
+        channels: u8,
+        sampling_rate: u32,
+        samples: Vec<i16>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestTimedAudioEvent {
+    pub time: u64,
+    pub data: GuestAudioEventData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestAudioSequence {
+    pub duration: u64,
+    pub events: Vec<GuestTimedAudioEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestAudioCommand {
+    Play {
+        handle: GuestAudioHandle,
+        sequence: GuestAudioSequence,
+        repeat: bool,
+    },
+    Stop {
+        handle: GuestAudioHandle,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuestAudioHostErrorCode {
+    DispatchFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestAudioHostError {
+    pub code: GuestAudioHostErrorCode,
+    pub message: String,
+}
+
+impl GuestAudioHostError {
+    #[must_use]
+    pub fn dispatch_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: GuestAudioHostErrorCode::DispatchFailed,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for GuestAudioHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl Error for GuestAudioHostError {}
+
+pub trait GuestAudioHost: Send + Sync {
+    fn dispatch(&self, command: GuestAudioCommand) -> Result<(), GuestAudioHostError>;
+}
+
 pub trait EmulatorBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
     fn required_host_services(&self) -> &'static [HostServiceKind];
@@ -892,6 +961,83 @@ mod tests {
         );
 
         assert!(poll_ready(repository.delete("records", "app-1")).expect("delete must succeed"));
+    }
+
+    #[test]
+    fn guest_audio_handle_is_exact_u32() {
+        let handle: GuestAudioHandle = u32::MAX;
+
+        assert_eq!(handle, u32::MAX);
+    }
+
+    #[test]
+    fn guest_audio_midi_event_preserves_raw_bytes() {
+        let event = GuestTimedAudioEvent {
+            time: 77,
+            data: GuestAudioEventData::Midi(vec![0x90, 60, 127, 0x80, 60, 0]),
+        };
+
+        assert_eq!(event.time, 77);
+        assert_eq!(event.data, GuestAudioEventData::Midi(vec![0x90, 60, 127, 0x80, 60, 0]));
+    }
+
+    #[test]
+    fn guest_audio_wave_event_preserves_format_and_i16_samples() {
+        let event = GuestTimedAudioEvent {
+            time: 123,
+            data: GuestAudioEventData::Wave {
+                channels: 2,
+                sampling_rate: 44_100,
+                samples: vec![-32_768, -1, 0, 1, 32_767],
+            },
+        };
+
+        assert_eq!(event.time, 123);
+        assert_eq!(
+            event.data,
+            GuestAudioEventData::Wave {
+                channels: 2,
+                sampling_rate: 44_100,
+                samples: vec![-32_768, -1, 0, 1, 32_767],
+            }
+        );
+    }
+
+    #[test]
+    fn guest_audio_play_and_stop_preserve_handle_repeat_and_sequence() {
+        let sequence = GuestAudioSequence {
+            duration: 900,
+            events: vec![GuestTimedAudioEvent {
+                time: 10,
+                data: GuestAudioEventData::Midi(vec![1, 2, 3]),
+            }],
+        };
+
+        let play = GuestAudioCommand::Play {
+            handle: 17,
+            sequence: sequence.clone(),
+            repeat: true,
+        };
+        let stop = GuestAudioCommand::Stop { handle: 17 };
+
+        assert_eq!(
+            play,
+            GuestAudioCommand::Play {
+                handle: 17,
+                sequence,
+                repeat: true,
+            }
+        );
+        assert_eq!(stop, GuestAudioCommand::Stop { handle: 17 });
+    }
+
+    #[test]
+    fn guest_audio_host_error_keeps_stable_code_and_message() {
+        let error = GuestAudioHostError::dispatch_failed("synthetic audio failure");
+
+        assert_eq!(error.code, GuestAudioHostErrorCode::DispatchFailed);
+        assert_eq!(error.message, "synthetic audio failure");
+        assert!(error.to_string().contains("DispatchFailed"));
     }
 
     #[test]
