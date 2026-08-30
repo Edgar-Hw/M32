@@ -184,6 +184,23 @@ pub fn create_j2me_jar_session(
     }))
 }
 
+pub fn create_j2me_jad_jar_session(
+    hosts: WiePlatformHosts,
+    jad: Vec<u8>,
+    jar_filename: String,
+    jar: Vec<u8>,
+) -> Result<Box<dyn EmulatorSession>, EmulatorSessionCreateError> {
+    let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+    let emulator =
+        wie_j2me::J2MEEmulator::from_jad_jar(platform, jad, jar_filename, jar).map_err(map_session_create_error)?;
+
+    Ok(Box::new(WieSession {
+        emulator: Box::new(emulator),
+        state: SessionState::Ready,
+    }))
+}
+
 fn map_session_create_error(error: impl Display) -> EmulatorSessionCreateError {
     EmulatorSessionCreateError::new(SessionCreateErrorCode::BackendLaunchFailed, error.to_string())
 }
@@ -1831,6 +1848,39 @@ mod tests {
             .expect("pinned J2ME constructor must accept ownership of platform and JAR bytes");
 
         assert_eq!(session.backend(), wie_backend_descriptor());
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    const FIRST_FRAME_LAUNCH_JAD: &[u8] = b"\
+MIDlet-Name: M32 First Frame Smoke\r\n\
+MIDlet-Version: 1.0.0\r\n\
+MIDlet-Vendor: M32\r\n\
+MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
+
+    #[test]
+    fn j2me_jad_jar_factory_constructs_ready_m32_session() {
+        let session = create_j2me_jad_jar_session(
+            recording_platform_hosts(),
+            FIRST_FRAME_LAUNCH_JAD.to_vec(),
+            "m32-first-frame.jar".to_owned(),
+            Vec::new(),
+        )
+        .expect("pinned JAD+JAR constructor must create a Ready M32 session");
+
+        assert_eq!(session.backend(), wie_backend_descriptor());
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    #[test]
+    fn j2me_jad_jar_factory_uses_explicit_launch_descriptor_path() {
+        let session = create_j2me_jad_jar_session(
+            recording_platform_hosts(),
+            FIRST_FRAME_LAUNCH_JAD.to_vec(),
+            "no-manifest-required.jar".to_owned(),
+            Vec::new(),
+        )
+        .expect("JAD+JAR factory must not require a JAR manifest during construction");
+
         assert_eq!(session.state(), SessionState::Ready);
     }
 
