@@ -95,6 +95,76 @@ impl WieBasicHostBridge {
     }
 }
 
+pub struct WiePlatformHosts {
+    pub display: Arc<dyn DisplayHost>,
+    pub clock: Arc<dyn ClockHost>,
+    pub database: Arc<dyn GuestDatabaseRepositoryHost>,
+    pub filesystem: Arc<dyn GuestFilesystemHost>,
+    pub audio: Arc<dyn GuestAudioHost>,
+    pub output: Arc<dyn GuestOutputHost>,
+    pub exit: Arc<dyn ExitHost>,
+    pub vibration: Arc<dyn VibrationHost>,
+}
+
+pub struct WiePlatformAdapter {
+    screen: WieScreenAdapter,
+    database_repository: WieDatabaseRepositoryAdapter,
+    filesystem: WieFilesystemAdapter,
+    audio: Arc<dyn GuestAudioHost>,
+    basic: WieBasicHostBridge,
+}
+
+impl WiePlatformAdapter {
+    #[must_use]
+    pub fn new(hosts: WiePlatformHosts) -> Self {
+        Self {
+            screen: WieScreenAdapter::new(hosts.display),
+            database_repository: WieDatabaseRepositoryAdapter::new(hosts.database),
+            filesystem: WieFilesystemAdapter::new(hosts.filesystem),
+            audio: hosts.audio,
+            basic: WieBasicHostBridge::new(hosts.clock, hosts.output, hosts.exit, hosts.vibration),
+        }
+    }
+}
+
+impl wie_backend::Platform for WiePlatformAdapter {
+    fn screen(&self) -> &dyn wie_backend::Screen {
+        &self.screen
+    }
+
+    fn now(&self) -> wie_backend::Instant {
+        wie_backend::Instant::from_epoch_millis(self.basic.epoch_millis())
+    }
+
+    fn database_repository(&self) -> &dyn wie_backend::DatabaseRepository {
+        &self.database_repository
+    }
+
+    fn filesystem(&self) -> &dyn wie_backend::Filesystem {
+        &self.filesystem
+    }
+
+    fn audio_sink(&self) -> Box<dyn wie_backend::AudioSink> {
+        Box::new(WieAudioSinkAdapter::new(self.audio.clone()))
+    }
+
+    fn write_stdout(&self, buf: &[u8]) {
+        self.basic.write_stdout(buf);
+    }
+
+    fn write_stderr(&self, buf: &[u8]) {
+        self.basic.write_stderr(buf);
+    }
+
+    fn exit(&self) {
+        self.basic.request_exit();
+    }
+
+    fn vibrate(&self, duration_ms: u64, intensity: u8) {
+        self.basic.vibrate(duration_ms, intensity);
+    }
+}
+
 pub struct WieAudioSinkAdapter {
     host: Arc<dyn GuestAudioHost>,
 }
@@ -1555,6 +1625,145 @@ mod tests {
         let sink = WieAudioSinkAdapter::new(Arc::new(FailingAudioHost));
 
         wie_backend::AudioSink::send(&sink, wie_backend::AudioCommand::Stop { handle: 1 });
+    }
+
+    struct RecordingPlatformFixture {
+        platform: WiePlatformAdapter,
+        output: Arc<RecordingOutput>,
+        exit: Arc<RecordingExit>,
+        vibration: Arc<RecordingVibration>,
+        filesystem: Arc<RecordingFilesystemHost>,
+        database: Arc<RecordingDatabaseRepository>,
+        audio: Arc<RecordingAudioHost>,
+    }
+
+    fn recording_platform() -> RecordingPlatformFixture {
+        let display = Arc::new(RecordingDisplayHost::default());
+        display
+            .resize(DisplaySize::new(240, 320))
+            .expect("synthetic display resize must succeed");
+
+        let output = Arc::new(RecordingOutput::default());
+        let exit = Arc::new(RecordingExit::default());
+        let vibration = Arc::new(RecordingVibration::default());
+        let filesystem = Arc::new(RecordingFilesystemHost::default());
+        let database = Arc::new(RecordingDatabaseRepository::default());
+        let audio = Arc::new(RecordingAudioHost::default());
+
+        let platform = WiePlatformAdapter::new(WiePlatformHosts {
+            display: display.clone(),
+            clock: Arc::new(FixedClock(1_725_123_456_789)),
+            database: database.clone(),
+            filesystem: filesystem.clone(),
+            audio: audio.clone(),
+            output: output.clone(),
+            exit: exit.clone(),
+            vibration: vibration.clone(),
+        });
+
+        RecordingPlatformFixture {
+            platform,
+            output,
+            exit,
+            vibration,
+            filesystem,
+            database,
+            audio,
+        }
+    }
+
+    #[test]
+    fn wie_platform_adapter_implements_pinned_platform_contract() {
+        fn assert_platform<T: wie_backend::Platform>() {}
+
+        assert_platform::<WiePlatformAdapter>();
+    }
+
+    #[test]
+    fn wie_platform_delegates_screen_clock_database_and_filesystem() {
+        let fixture = recording_platform();
+
+        let platform_ref: &dyn wie_backend::Platform = &fixture.platform;
+
+        assert_eq!(platform_ref.screen().width(), 240);
+        assert_eq!(platform_ref.screen().height(), 320);
+        assert_eq!(platform_ref.now().raw(), 1_725_123_456_789);
+
+        assert!(block_on_ready(wie_backend::DatabaseRepository::exists(
+            platform_ref.database_repository(),
+            "records",
+            "game.app"
+        )));
+        assert!(block_on_ready(wie_backend::Filesystem::exists(
+            platform_ref.filesystem(),
+            "game.aid",
+            "save/state.bin"
+        )));
+
+        assert_eq!(
+            *fixture
+                .database
+                .last_exists
+                .lock()
+                .expect("database exists mutex poisoned"),
+            Some(RecordedDatabaseOpen {
+                name: "records".to_owned(),
+                app_id: "game.app".to_owned(),
+            })
+        );
+        assert_eq!(
+            *fixture
+                .filesystem
+                .calls
+                .lock()
+                .expect("filesystem calls mutex poisoned"),
+            vec!["exists:game.aid:save/state.bin"]
+        );
+    }
+
+    #[test]
+    fn wie_platform_delegates_output_exit_and_vibration() {
+        let fixture = recording_platform();
+
+        let platform_ref: &dyn wie_backend::Platform = &fixture.platform;
+
+        platform_ref.write_stdout(&[0x00, 0xFF, b'O']);
+        platform_ref.write_stderr(&[0x80, b'E']);
+        platform_ref.exit();
+        platform_ref.vibrate(650, 144);
+
+        assert_eq!(
+            *fixture.output.stdout.lock().expect("stdout mutex poisoned"),
+            vec![0x00, 0xFF, b'O']
+        );
+        assert_eq!(
+            *fixture.output.stderr.lock().expect("stderr mutex poisoned"),
+            vec![0x80, b'E']
+        );
+        assert_eq!(*fixture.exit.count.lock().expect("exit mutex poisoned"), 1);
+        assert_eq!(
+            *fixture.vibration.last.lock().expect("vibration mutex poisoned"),
+            Some((650, 144))
+        );
+    }
+
+    #[test]
+    fn wie_platform_creates_audio_sink_backed_by_shared_m32_audio_host() {
+        let fixture = recording_platform();
+
+        let sink_a = wie_backend::Platform::audio_sink(&fixture.platform);
+        let sink_b = wie_backend::Platform::audio_sink(&fixture.platform);
+
+        sink_a.send(wie_backend::AudioCommand::Stop { handle: 11 });
+        sink_b.send(wie_backend::AudioCommand::Stop { handle: 12 });
+
+        assert_eq!(
+            *fixture.audio.commands.lock().expect("audio commands mutex poisoned"),
+            vec![
+                GuestAudioCommand::Stop { handle: 11 },
+                GuestAudioCommand::Stop { handle: 12 },
+            ]
+        );
     }
 
     #[test]
