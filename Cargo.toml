@@ -20,3 +20,8 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
+
+[workspace.metadata.m32.quality]
+fmt = "cargo fmt --all -- --check"
+clippy = "cargo clippy --workspace --all-targets -- -D warnings"
+test = "cargo test --workspace"
