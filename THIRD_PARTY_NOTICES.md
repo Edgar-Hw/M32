@@ -1,6 +1,6 @@
 # M32 Third-Party Notices
 
-Last reviewed for Task: `0.0.1-T005`
+Last reviewed for Task: `0.0.1-T009`
 
 This file records third-party software that M32 uses, bundles, or has reserved
 as an explicitly planned upstream dependency in the locked implementation plan.
@@ -8,15 +8,35 @@ as an explicitly planned upstream dependency in the locked implementation plan.
 The presence of a project in the "planned" section does **not** mean that its
 code is already linked into the current M32 build.
 
-## 1. Current T005 application build
+## 1. Current application build
 
-At `0.0.1-T005`, the M32 application workspace does not yet link the emulator
-core, fonts, audio libraries, SoundFonts, or other third-party application
-runtime packages.
+### tracing
+
+- Project: tracing
+- Version: 0.1.44
+- Upstream: https://github.com/tokio-rs/tracing
+- Purpose in M32: structured application diagnostics and events
+- License: MIT
+- Copyright: Copyright (c) 2019 Tokio Contributors
+- Current status: linked by `m32-desktop`
+
+### tracing-subscriber
+
+- Project: tracing-subscriber
+- Version: 0.3.23
+- Upstream: https://github.com/tokio-rs/tracing
+- Purpose in M32: console subscriber/formatter for tracing events
+- License: MIT
+- Copyright: Copyright (c) 2019 Tokio Contributors
+- Current status: linked by `m32-desktop`
+- M32 feature selection: default features disabled; `fmt`, `std` enabled
+
+The upstream MIT permission and warranty terms must be preserved in
+distributions that contain substantial portions of these projects.
 
 The Rust compiler, Cargo, rustfmt, Clippy, Windows SDK/MSVC tooling, Git, and
 GitHub Actions runner tooling are development/build infrastructure and are not
-bundled by M32 as application runtime content at this stage.
+bundled by M32 as application runtime content.
 
 Whenever a new runtime/library/font/audio component is added, this notice must
 be updated in the same Task or dependency-change commit.
@@ -25,7 +45,7 @@ be updated in the same Task or dependency-change commit.
 
 The following projects are listed now because the M32 locked architecture
 explicitly plans to consume them in later Tasks. They are **not yet linked in
-the T005 build**.
+the T009 build**.
 
 ### WIE
 
@@ -36,7 +56,7 @@ the T005 build**.
   `f0513eb758c02736981f545ad030eed937d55f3e`
 - License: MIT
 - Copyright: Copyright 2020 Inseok Lee
-- Current T005 status: planned / not yet linked
+- Current T009 status: planned / not yet linked
 
 MIT permission and warranty terms are provided by the upstream project's
 LICENSE and must be preserved in M32 distributions that include substantial
@@ -50,7 +70,7 @@ portions of WIE.
   planned WIE integration
 - License: MIT
 - Copyright: Copyright 2020 Inseok Lee
-- Current T005 status: planned / not yet linked
+- Current T009 status: planned / not yet linked
 
 MIT permission and warranty terms are provided by the upstream project's
 LICENSE and must be preserved in M32 distributions that include substantial
@@ -58,7 +78,7 @@ portions of RustJava.
 
 ## 3. Components not yet selected
 
-The following categories deliberately have no final component selected at T005:
+The following categories deliberately have no final component selected at T009:
 
 - M32 UI fonts
 - MIDI software synthesizer

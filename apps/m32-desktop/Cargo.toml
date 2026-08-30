@@ -10,3 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 m32-domain = { path = "../../crates/m32-domain" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
