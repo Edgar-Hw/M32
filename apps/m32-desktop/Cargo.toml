@@ -7,3 +7,6 @@ publish = false
 [[bin]]
 name = "m32"
 path = "src/main.rs"
+
+[dependencies]
+m32-domain = { path = "../../crates/m32-domain" }

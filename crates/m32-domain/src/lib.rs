@@ -1,1 +1,3 @@
-//! M32 m32 domain crate.
+pub mod build_info;
+
+pub use build_info::BuildInfo;
