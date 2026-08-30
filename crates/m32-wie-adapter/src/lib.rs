@@ -3,12 +3,13 @@
 //! WIE backend types stay private to this crate. M32-facing callers consume contracts from
 //! `m32-emulator-api`.
 
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
 
 use m32_emulator_api::{
-    BackendDescriptor, EmulatorBackend, EmulatorSession, EmulatorSessionError, HostServiceKind, SessionErrorCode,
-    SessionState,
+    BackendDescriptor, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
+    EmulatorSessionError, HostServiceKind, RgbaFrame, SessionErrorCode, SessionState,
 };
+use wie_util::WieError;
 
 pub const WIE_REPOSITORY: &str = "https://github.com/dlunch/wie.git";
 pub const WIE_REVISION: &str = "f0513eb758c02736981f545ad030eed937d55f3e";
@@ -44,6 +45,59 @@ impl EmulatorBackend for WieBackendAdapter {
 
     fn required_host_services(&self) -> &'static [HostServiceKind] {
         WIE_REQUIRED_HOST_SERVICES
+    }
+}
+
+pub struct WieScreenAdapter {
+    host: Arc<dyn DisplayHost>,
+}
+
+impl WieScreenAdapter {
+    #[must_use]
+    pub fn new(host: Arc<dyn DisplayHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl wie_backend::Screen for WieScreenAdapter {
+    fn resize(&self, width: u32, height: u32) -> wie_util::Result<()> {
+        self.host
+            .resize(DisplaySize::new(width, height))
+            .map_err(map_display_host_error)
+    }
+
+    fn request_redraw(&self) -> wie_util::Result<()> {
+        self.host.request_redraw().map_err(map_display_host_error)
+    }
+
+    fn paint(&self, image: &dyn wie_backend::canvas::Image) {
+        let Some(frame) = copy_wie_image_to_rgba8(image) else {
+            tracing::error!(
+                target: "m32::display",
+                event = "wie_frame_dimension_overflow",
+                width = image.width(),
+                height = image.height(),
+                "WIE frame dimensions overflow M32 RGBA8 frame size"
+            );
+            return;
+        };
+
+        if let Err(error) = self.host.present_rgba8(frame) {
+            tracing::error!(
+                target: "m32::display",
+                event = "wie_frame_present_failed",
+                error_code = ?error.code,
+                "M32 display host rejected WIE frame"
+            );
+        }
+    }
+
+    fn width(&self) -> u32 {
+        self.host.size().width
+    }
+
+    fn height(&self) -> u32 {
+        self.host.size().height
     }
 }
 
@@ -83,9 +137,108 @@ fn map_tick_error(error: impl Display) -> EmulatorSessionError {
     EmulatorSessionError::new(SessionErrorCode::BackendTickFailed, error.to_string())
 }
 
+fn map_display_host_error(error: DisplayHostError) -> WieError {
+    WieError::FatalError(format!("M32 display host failure: {error}"))
+}
+
+fn copy_wie_image_to_rgba8(image: &dyn wie_backend::canvas::Image) -> Option<RgbaFrame> {
+    let size = DisplaySize::new(image.width(), image.height());
+    let byte_len = size.rgba8_byte_len()?;
+    let mut pixels = Vec::with_capacity(byte_len);
+
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            let color = image.get_pixel(x as i32, y as i32);
+            pixels.extend_from_slice(&[color.r, color.g, color.b, color.a]);
+        }
+    }
+
+    RgbaFrame::try_new(size, pixels).ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        borrow::Cow,
+        sync::{Arc, Mutex},
+    };
+
     use super::*;
+    use m32_emulator_api::DisplayHostErrorCode;
+    use wie_backend::{Screen, canvas::Color};
+
+    #[derive(Default)]
+    struct RecordingDisplayHost {
+        size: Mutex<DisplaySize>,
+        redraw_count: Mutex<u32>,
+        last_frame: Mutex<Option<RgbaFrame>>,
+    }
+
+    impl DisplayHost for RecordingDisplayHost {
+        fn resize(&self, size: DisplaySize) -> Result<(), DisplayHostError> {
+            *self.size.lock().expect("size mutex poisoned") = size;
+            Ok(())
+        }
+
+        fn request_redraw(&self) -> Result<(), DisplayHostError> {
+            let mut count = self.redraw_count.lock().expect("redraw mutex poisoned");
+            *count += 1;
+            Ok(())
+        }
+
+        fn present_rgba8(&self, frame: RgbaFrame) -> Result<(), DisplayHostError> {
+            *self.last_frame.lock().expect("frame mutex poisoned") = Some(frame);
+            Ok(())
+        }
+
+        fn size(&self) -> DisplaySize {
+            *self.size.lock().expect("size mutex poisoned")
+        }
+    }
+
+    struct SyntheticWieImage;
+
+    impl wie_backend::canvas::Image for SyntheticWieImage {
+        fn width(&self) -> u32 {
+            2
+        }
+
+        fn height(&self) -> u32 {
+            1
+        }
+
+        fn bytes_per_pixel(&self) -> u32 {
+            4
+        }
+
+        fn get_pixel(&self, x: i32, y: i32) -> Color {
+            assert_eq!(y, 0);
+
+            match x {
+                0 => Color {
+                    a: 255,
+                    r: 10,
+                    g: 20,
+                    b: 30,
+                },
+                1 => Color {
+                    a: 128,
+                    r: 40,
+                    g: 50,
+                    b: 60,
+                },
+                _ => panic!("unexpected x coordinate"),
+            }
+        }
+
+        fn raw(&self) -> Cow<'_, [u8]> {
+            Cow::Borrowed(&[])
+        }
+
+        fn colors(&self) -> Vec<Color> {
+            vec![self.get_pixel(0, 0), self.get_pixel(1, 0)]
+        }
+    }
 
     #[test]
     fn upstream_revision_matches_locked_baseline() {
@@ -150,6 +303,55 @@ mod tests {
         }
 
         let _ = compile_probe as fn(&dyn wie_backend::Platform);
+    }
+
+    #[test]
+    fn wie_screen_adapter_implements_pinned_screen_contract() {
+        fn assert_screen<T: wie_backend::Screen>() {}
+
+        assert_screen::<WieScreenAdapter>();
+    }
+
+    #[test]
+    fn wie_screen_resize_and_redraw_delegate_to_m32_host() {
+        let host = Arc::new(RecordingDisplayHost::default());
+        let screen = WieScreenAdapter::new(host.clone());
+
+        screen.resize(240, 320).expect("resize must succeed");
+        screen.request_redraw().expect("redraw request must succeed");
+
+        assert_eq!(screen.width(), 240);
+        assert_eq!(screen.height(), 320);
+        assert_eq!(*host.redraw_count.lock().expect("redraw mutex poisoned"), 1);
+    }
+
+    #[test]
+    fn wie_screen_paint_converts_colors_to_canonical_rgba8() {
+        let host = Arc::new(RecordingDisplayHost::default());
+        let screen = WieScreenAdapter::new(host.clone());
+
+        screen.paint(&SyntheticWieImage);
+
+        let frame = host
+            .last_frame
+            .lock()
+            .expect("frame mutex poisoned")
+            .clone()
+            .expect("frame must be presented");
+
+        assert_eq!(frame.size, DisplaySize::new(2, 1));
+        assert_eq!(frame.pixels, vec![10, 20, 30, 255, 40, 50, 60, 128]);
+    }
+
+    #[test]
+    fn display_host_error_maps_to_wie_fatal_error() {
+        let error = map_display_host_error(DisplayHostError::new(
+            DisplayHostErrorCode::ResizeFailed,
+            "synthetic resize failure",
+        ));
+
+        assert!(matches!(error, WieError::FatalError(_)));
+        assert!(error.to_string().contains("synthetic resize failure"));
     }
 
     #[test]

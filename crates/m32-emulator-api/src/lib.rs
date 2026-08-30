@@ -55,6 +55,131 @@ impl HostServiceKind {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DisplaySize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DisplaySize {
+    #[must_use]
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    #[must_use]
+    pub const fn pixel_count(self) -> Option<usize> {
+        match (self.width as usize).checked_mul(self.height as usize) {
+            Some(value) => Some(value),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn rgba8_byte_len(self) -> Option<usize> {
+        match self.pixel_count() {
+            Some(pixel_count) => pixel_count.checked_mul(4),
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameValidationErrorCode {
+    DimensionOverflow,
+    ByteLengthMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameValidationError {
+    pub code: FrameValidationErrorCode,
+    pub expected_bytes: Option<usize>,
+    pub actual_bytes: usize,
+}
+
+impl fmt::Display for FrameValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.code {
+            FrameValidationErrorCode::DimensionOverflow => {
+                write!(formatter, "display dimensions overflow RGBA8 byte length")
+            }
+            FrameValidationErrorCode::ByteLengthMismatch => write!(
+                formatter,
+                "RGBA8 byte length mismatch: expected {:?}, got {}",
+                self.expected_bytes, self.actual_bytes
+            ),
+        }
+    }
+}
+
+impl Error for FrameValidationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbaFrame {
+    pub size: DisplaySize,
+    pub pixels: Vec<u8>,
+}
+
+impl RgbaFrame {
+    pub fn try_new(size: DisplaySize, pixels: Vec<u8>) -> Result<Self, FrameValidationError> {
+        let Some(expected_bytes) = size.rgba8_byte_len() else {
+            return Err(FrameValidationError {
+                code: FrameValidationErrorCode::DimensionOverflow,
+                expected_bytes: None,
+                actual_bytes: pixels.len(),
+            });
+        };
+
+        if pixels.len() != expected_bytes {
+            return Err(FrameValidationError {
+                code: FrameValidationErrorCode::ByteLengthMismatch,
+                expected_bytes: Some(expected_bytes),
+                actual_bytes: pixels.len(),
+            });
+        }
+
+        Ok(Self { size, pixels })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisplayHostErrorCode {
+    ResizeFailed,
+    RedrawFailed,
+    PresentFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayHostError {
+    pub code: DisplayHostErrorCode,
+    pub message: String,
+}
+
+impl DisplayHostError {
+    #[must_use]
+    pub fn new(code: DisplayHostErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for DisplayHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl Error for DisplayHostError {}
+
+pub trait DisplayHost: Send + Sync {
+    fn resize(&self, size: DisplaySize) -> Result<(), DisplayHostError>;
+    fn request_redraw(&self) -> Result<(), DisplayHostError>;
+    fn present_rgba8(&self, frame: RgbaFrame) -> Result<(), DisplayHostError>;
+    fn size(&self) -> DisplaySize;
+}
+
 pub trait EmulatorBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
     fn required_host_services(&self) -> &'static [HostServiceKind];
@@ -200,6 +325,42 @@ mod tests {
                 assert_ne!(services[left], services[right]);
             }
         }
+    }
+
+    #[test]
+    fn display_size_calculates_rgba8_length() {
+        let size = DisplaySize::new(240, 320);
+
+        assert_eq!(size.pixel_count(), Some(76_800));
+        assert_eq!(size.rgba8_byte_len(), Some(307_200));
+    }
+
+    #[test]
+    fn rgba_frame_rejects_byte_length_mismatch() {
+        let error = RgbaFrame::try_new(DisplaySize::new(2, 1), vec![0; 7])
+            .expect_err("7 bytes must not represent a 2x1 RGBA8 frame");
+
+        assert_eq!(error.code, FrameValidationErrorCode::ByteLengthMismatch);
+        assert_eq!(error.expected_bytes, Some(8));
+        assert_eq!(error.actual_bytes, 7);
+    }
+
+    #[test]
+    fn rgba_frame_accepts_exact_byte_length() {
+        let frame =
+            RgbaFrame::try_new(DisplaySize::new(2, 1), vec![0; 8]).expect("8 bytes must represent a 2x1 RGBA8 frame");
+
+        assert_eq!(frame.size, DisplaySize::new(2, 1));
+        assert_eq!(frame.pixels.len(), 8);
+    }
+
+    #[test]
+    fn display_host_error_keeps_stable_code_and_message() {
+        let error = DisplayHostError::new(DisplayHostErrorCode::PresentFailed, "synthetic failure");
+
+        assert_eq!(error.code, DisplayHostErrorCode::PresentFailed);
+        assert_eq!(error.message, "synthetic failure");
+        assert!(error.to_string().contains("PresentFailed"));
     }
 
     #[test]

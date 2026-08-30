@@ -277,7 +277,9 @@ name = "m32-wie-adapter"
 version = "0.0.0"
 dependencies = [
  "m32-emulator-api",
+ "tracing",
  "wie_backend",
+ "wie_util",
 ]
 
 [[package]]

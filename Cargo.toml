@@ -25,6 +25,7 @@ edition = "2024"
 tracing = "=0.1.41"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
 wie_backend = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_backend" }
+wie_util = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_util" }
 
 [workspace.metadata.m32.quality]
 fmt = "cargo fmt --all -- --check"
