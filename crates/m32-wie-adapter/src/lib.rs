@@ -7,8 +7,9 @@ use std::{fmt::Display, sync::Arc};
 
 use m32_emulator_api::{
     BackendDescriptor, ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
-    EmulatorSessionError, ExitHost, GuestFilesystemError, GuestFilesystemHost, GuestOutputHost, HostServiceKind,
-    RgbaFrame, SessionErrorCode, SessionState, VibrationHost,
+    EmulatorSessionError, ExitHost, GuestDatabaseError, GuestDatabaseHost, GuestDatabaseRepositoryHost,
+    GuestFilesystemError, GuestFilesystemHost, GuestOutputHost, HostServiceKind, RgbaFrame, SessionErrorCode,
+    SessionState, VibrationHost,
 };
 use wie_util::WieError;
 
@@ -91,6 +92,173 @@ impl WieBasicHostBridge {
     pub fn vibrate(&self, duration_ms: u64, intensity: u8) {
         self.vibration.vibrate(duration_ms, intensity);
     }
+}
+
+pub struct WieDatabaseRepositoryAdapter {
+    host: Arc<dyn GuestDatabaseRepositoryHost>,
+}
+
+impl WieDatabaseRepositoryAdapter {
+    #[must_use]
+    pub fn new(host: Arc<dyn GuestDatabaseRepositoryHost>) -> Self {
+        Self { host }
+    }
+}
+
+#[async_trait::async_trait]
+impl wie_backend::DatabaseRepository for WieDatabaseRepositoryAdapter {
+    async fn open(&self, name: &str, app_id: &str) -> Box<dyn wie_backend::Database> {
+        match self.host.open(name, app_id).await {
+            Ok(database) => Box::new(WieDatabaseAdapter::new(database)),
+            Err(error) => {
+                log_database_host_error("open", &error);
+                Box::new(UnavailableWieDatabase)
+            }
+        }
+    }
+
+    async fn exists(&self, name: &str, app_id: &str) -> bool {
+        match self.host.exists(name, app_id).await {
+            Ok(exists) => exists,
+            Err(error) => {
+                log_database_host_error("exists", &error);
+                false
+            }
+        }
+    }
+
+    async fn delete(&self, name: &str, app_id: &str) -> bool {
+        match self.host.delete(name, app_id).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                log_database_host_error("delete_repository", &error);
+                false
+            }
+        }
+    }
+
+    async fn usage(&self, app_id: &str) -> u64 {
+        match self.host.usage(app_id).await {
+            Ok(usage) => usage,
+            Err(error) => {
+                log_database_host_error("usage", &error);
+                0
+            }
+        }
+    }
+}
+
+pub struct WieDatabaseAdapter {
+    host: Box<dyn GuestDatabaseHost>,
+}
+
+impl WieDatabaseAdapter {
+    #[must_use]
+    pub fn new(host: Box<dyn GuestDatabaseHost>) -> Self {
+        Self { host }
+    }
+}
+
+#[async_trait::async_trait]
+impl wie_backend::Database for WieDatabaseAdapter {
+    async fn next_id(&self) -> wie_backend::RecordId {
+        match self.host.next_id().await {
+            Ok(id) => id,
+            Err(error) => {
+                log_database_host_error("next_id", &error);
+                0
+            }
+        }
+    }
+
+    async fn add(&mut self, data: &[u8]) -> wie_backend::RecordId {
+        match self.host.add(data).await {
+            Ok(id) => id,
+            Err(error) => {
+                log_database_host_error("add", &error);
+                0
+            }
+        }
+    }
+
+    async fn get(&self, id: wie_backend::RecordId) -> Option<Vec<u8>> {
+        match self.host.get(id).await {
+            Ok(data) => data,
+            Err(error) => {
+                log_database_host_error("get", &error);
+                None
+            }
+        }
+    }
+
+    async fn set(&mut self, id: wie_backend::RecordId, data: &[u8]) -> bool {
+        match self.host.set(id, data).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                log_database_host_error("set", &error);
+                false
+            }
+        }
+    }
+
+    async fn delete(&mut self, id: wie_backend::RecordId) -> bool {
+        match self.host.delete(id).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                log_database_host_error("delete_record", &error);
+                false
+            }
+        }
+    }
+
+    async fn get_record_ids(&self) -> Vec<wie_backend::RecordId> {
+        match self.host.record_ids().await {
+            Ok(record_ids) => record_ids,
+            Err(error) => {
+                log_database_host_error("record_ids", &error);
+                Vec::new()
+            }
+        }
+    }
+}
+
+struct UnavailableWieDatabase;
+
+#[async_trait::async_trait]
+impl wie_backend::Database for UnavailableWieDatabase {
+    async fn next_id(&self) -> wie_backend::RecordId {
+        0
+    }
+
+    async fn add(&mut self, _data: &[u8]) -> wie_backend::RecordId {
+        0
+    }
+
+    async fn get(&self, _id: wie_backend::RecordId) -> Option<Vec<u8>> {
+        None
+    }
+
+    async fn set(&mut self, _id: wie_backend::RecordId, _data: &[u8]) -> bool {
+        false
+    }
+
+    async fn delete(&mut self, _id: wie_backend::RecordId) -> bool {
+        false
+    }
+
+    async fn get_record_ids(&self) -> Vec<wie_backend::RecordId> {
+        Vec::new()
+    }
+}
+
+fn log_database_host_error(operation: &'static str, error: &GuestDatabaseError) {
+    tracing::warn!(
+        target: "m32::storage",
+        event = "wie_database_host_failed",
+        operation,
+        error_code = ?error.code,
+        "M32 guest database host operation failed"
+    );
 }
 
 pub struct WieFilesystemAdapter {
@@ -861,6 +1029,331 @@ mod tests {
             block_on_ready(wie_backend::Filesystem::write(&filesystem, "aid", "file", 0, &[1, 2])),
             0
         );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedDatabaseOpen {
+        name: String,
+        app_id: String,
+    }
+
+    #[derive(Default)]
+    struct RecordingDatabase {
+        records: Vec<(u32, Vec<u8>)>,
+        next_id: u32,
+    }
+
+    impl RecordingDatabase {
+        fn seeded() -> Self {
+            Self {
+                records: vec![(3, vec![1, 2, 3])],
+                next_id: 4,
+            }
+        }
+    }
+
+    impl GuestDatabaseHost for RecordingDatabase {
+        fn next_id<'a>(&'a self) -> m32_emulator_api::HostFuture<'a, Result<u32, GuestDatabaseError>> {
+            Box::pin(async move { Ok(self.next_id) })
+        }
+
+        fn add<'a>(&'a mut self, data: &'a [u8]) -> m32_emulator_api::HostFuture<'a, Result<u32, GuestDatabaseError>> {
+            Box::pin(async move {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.records.push((id, data.to_vec()));
+                Ok(id)
+            })
+        }
+
+        fn get<'a>(&'a self, id: u32) -> m32_emulator_api::HostFuture<'a, Result<Option<Vec<u8>>, GuestDatabaseError>> {
+            Box::pin(async move {
+                Ok(self
+                    .records
+                    .iter()
+                    .find(|(record_id, _)| *record_id == id)
+                    .map(|(_, data)| data.clone()))
+            })
+        }
+
+        fn set<'a>(
+            &'a mut self,
+            id: u32,
+            data: &'a [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                let Some((_, stored)) = self.records.iter_mut().find(|(record_id, _)| *record_id == id) else {
+                    return Ok(false);
+                };
+
+                *stored = data.to_vec();
+                Ok(true)
+            })
+        }
+
+        fn delete<'a>(&'a mut self, id: u32) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                let before = self.records.len();
+                self.records.retain(|(record_id, _)| *record_id != id);
+                Ok(before != self.records.len())
+            })
+        }
+
+        fn record_ids<'a>(&'a self) -> m32_emulator_api::HostFuture<'a, Result<Vec<u32>, GuestDatabaseError>> {
+            Box::pin(async move { Ok(self.records.iter().map(|(record_id, _)| *record_id).collect()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDatabaseRepository {
+        last_open: Mutex<Option<RecordedDatabaseOpen>>,
+        last_exists: Mutex<Option<RecordedDatabaseOpen>>,
+        last_delete: Mutex<Option<RecordedDatabaseOpen>>,
+        last_usage_app_id: Mutex<Option<String>>,
+    }
+
+    impl GuestDatabaseRepositoryHost for RecordingDatabaseRepository {
+        fn open<'a>(
+            &'a self,
+            name: &'a str,
+            app_id: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<Box<dyn GuestDatabaseHost>, GuestDatabaseError>> {
+            Box::pin(async move {
+                *self.last_open.lock().expect("database open mutex poisoned") = Some(RecordedDatabaseOpen {
+                    name: name.to_owned(),
+                    app_id: app_id.to_owned(),
+                });
+
+                Ok(Box::new(RecordingDatabase::seeded()) as Box<dyn GuestDatabaseHost>)
+            })
+        }
+
+        fn exists<'a>(
+            &'a self,
+            name: &'a str,
+            app_id: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                *self.last_exists.lock().expect("database exists mutex poisoned") = Some(RecordedDatabaseOpen {
+                    name: name.to_owned(),
+                    app_id: app_id.to_owned(),
+                });
+                Ok(true)
+            })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            name: &'a str,
+            app_id: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                *self.last_delete.lock().expect("database delete mutex poisoned") = Some(RecordedDatabaseOpen {
+                    name: name.to_owned(),
+                    app_id: app_id.to_owned(),
+                });
+                Ok(true)
+            })
+        }
+
+        fn usage<'a>(&'a self, app_id: &'a str) -> m32_emulator_api::HostFuture<'a, Result<u64, GuestDatabaseError>> {
+            Box::pin(async move {
+                *self.last_usage_app_id.lock().expect("database usage mutex poisoned") = Some(app_id.to_owned());
+                Ok(456)
+            })
+        }
+    }
+
+    struct FailingDatabase;
+
+    impl GuestDatabaseHost for FailingDatabase {
+        fn next_id<'a>(&'a self) -> m32_emulator_api::HostFuture<'a, Result<u32, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("next_id failure")) })
+        }
+
+        fn add<'a>(&'a mut self, _data: &'a [u8]) -> m32_emulator_api::HostFuture<'a, Result<u32, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("add failure")) })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _id: u32,
+        ) -> m32_emulator_api::HostFuture<'a, Result<Option<Vec<u8>>, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("get failure")) })
+        }
+
+        fn set<'a>(
+            &'a mut self,
+            _id: u32,
+            _data: &'a [u8],
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("set failure")) })
+        }
+
+        fn delete<'a>(&'a mut self, _id: u32) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("delete failure")) })
+        }
+
+        fn record_ids<'a>(&'a self) -> m32_emulator_api::HostFuture<'a, Result<Vec<u32>, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("record_ids failure")) })
+        }
+    }
+
+    struct FailingDatabaseRepository;
+
+    impl GuestDatabaseRepositoryHost for FailingDatabaseRepository {
+        fn open<'a>(
+            &'a self,
+            _name: &'a str,
+            _app_id: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<Box<dyn GuestDatabaseHost>, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("open failure")) })
+        }
+
+        fn exists<'a>(
+            &'a self,
+            _name: &'a str,
+            _app_id: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("exists failure")) })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _name: &'a str,
+            _app_id: &'a str,
+        ) -> m32_emulator_api::HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("repository delete failure")) })
+        }
+
+        fn usage<'a>(&'a self, _app_id: &'a str) -> m32_emulator_api::HostFuture<'a, Result<u64, GuestDatabaseError>> {
+            Box::pin(async { Err(GuestDatabaseError::operation_failed("usage failure")) })
+        }
+    }
+
+    #[test]
+    fn wie_database_adapters_implement_pinned_database_contracts() {
+        fn assert_database<T: wie_backend::Database>() {}
+        fn assert_repository<T: wie_backend::DatabaseRepository>() {}
+
+        assert_database::<WieDatabaseAdapter>();
+        assert_repository::<WieDatabaseRepositoryAdapter>();
+    }
+
+    #[test]
+    fn wie_database_repository_preserves_name_app_id_and_usage() {
+        let host = Arc::new(RecordingDatabaseRepository::default());
+        let repository = WieDatabaseRepositoryAdapter::new(host.clone());
+
+        assert!(block_on_ready(wie_backend::DatabaseRepository::exists(
+            &repository,
+            "records",
+            "game.app"
+        )));
+        assert_eq!(
+            block_on_ready(wie_backend::DatabaseRepository::usage(&repository, "game.app")),
+            456
+        );
+        assert!(block_on_ready(wie_backend::DatabaseRepository::delete(
+            &repository,
+            "records",
+            "game.app"
+        )));
+
+        assert_eq!(
+            *host.last_exists.lock().expect("database exists mutex poisoned"),
+            Some(RecordedDatabaseOpen {
+                name: "records".to_owned(),
+                app_id: "game.app".to_owned(),
+            })
+        );
+        assert_eq!(
+            *host.last_delete.lock().expect("database delete mutex poisoned"),
+            Some(RecordedDatabaseOpen {
+                name: "records".to_owned(),
+                app_id: "game.app".to_owned(),
+            })
+        );
+        assert_eq!(
+            *host.last_usage_app_id.lock().expect("database usage mutex poisoned"),
+            Some("game.app".to_owned())
+        );
+    }
+
+    #[test]
+    fn wie_database_open_returns_working_record_bridge() {
+        let host = Arc::new(RecordingDatabaseRepository::default());
+        let repository = WieDatabaseRepositoryAdapter::new(host.clone());
+
+        let mut database = block_on_ready(wie_backend::DatabaseRepository::open(
+            &repository,
+            "records",
+            "game.app",
+        ));
+
+        assert_eq!(
+            *host.last_open.lock().expect("database open mutex poisoned"),
+            Some(RecordedDatabaseOpen {
+                name: "records".to_owned(),
+                app_id: "game.app".to_owned(),
+            })
+        );
+
+        assert_eq!(block_on_ready(database.next_id()), 4);
+        assert_eq!(block_on_ready(database.get(3)), Some(vec![1, 2, 3]));
+
+        assert!(block_on_ready(database.set(3, &[7, 8])));
+        assert_eq!(block_on_ready(database.get(3)), Some(vec![7, 8]));
+
+        assert_eq!(block_on_ready(database.add(&[9])), 4);
+        assert_eq!(block_on_ready(database.get_record_ids()), vec![3, 4]);
+
+        assert!(block_on_ready(database.delete(3)));
+        assert_eq!(block_on_ready(database.get_record_ids()), vec![4]);
+    }
+
+    #[test]
+    fn wie_database_repository_errors_map_to_safe_fallbacks() {
+        let repository = WieDatabaseRepositoryAdapter::new(Arc::new(FailingDatabaseRepository));
+
+        assert!(!block_on_ready(wie_backend::DatabaseRepository::exists(
+            &repository,
+            "records",
+            "game.app"
+        )));
+        assert!(!block_on_ready(wie_backend::DatabaseRepository::delete(
+            &repository,
+            "records",
+            "game.app"
+        )));
+        assert_eq!(
+            block_on_ready(wie_backend::DatabaseRepository::usage(&repository, "game.app")),
+            0
+        );
+
+        let mut database = block_on_ready(wie_backend::DatabaseRepository::open(
+            &repository,
+            "records",
+            "game.app",
+        ));
+        assert_eq!(block_on_ready(database.next_id()), 0);
+        assert_eq!(block_on_ready(database.add(&[1, 2])), 0);
+        assert_eq!(block_on_ready(database.get(1)), None);
+        assert!(!block_on_ready(database.set(1, &[3])));
+        assert!(!block_on_ready(database.delete(1)));
+        assert!(block_on_ready(database.get_record_ids()).is_empty());
+    }
+
+    #[test]
+    fn wie_database_record_errors_map_to_safe_fallbacks() {
+        let mut database = WieDatabaseAdapter::new(Box::new(FailingDatabase));
+
+        assert_eq!(block_on_ready(wie_backend::Database::next_id(&database)), 0);
+        assert_eq!(block_on_ready(wie_backend::Database::add(&mut database, &[1])), 0);
+        assert_eq!(block_on_ready(wie_backend::Database::get(&database, 7)), None);
+        assert!(!block_on_ready(wie_backend::Database::set(&mut database, 7, &[2])));
+        assert!(!block_on_ready(wie_backend::Database::delete(&mut database, 7)));
+        assert!(block_on_ready(wie_backend::Database::get_record_ids(&database)).is_empty());
     }
 
     #[test]

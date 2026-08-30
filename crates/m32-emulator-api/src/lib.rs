@@ -258,6 +258,69 @@ pub trait GuestFilesystemHost: Send + Sync {
     ) -> HostFuture<'a, Result<(), GuestFilesystemError>>;
 }
 
+pub type GuestDatabaseRecordId = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuestDatabaseErrorCode {
+    OperationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestDatabaseError {
+    pub code: GuestDatabaseErrorCode,
+    pub message: String,
+}
+
+impl GuestDatabaseError {
+    #[must_use]
+    pub fn operation_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: GuestDatabaseErrorCode::OperationFailed,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for GuestDatabaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl Error for GuestDatabaseError {}
+
+pub trait GuestDatabaseHost: Send + Sync {
+    fn next_id<'a>(&'a self) -> HostFuture<'a, Result<GuestDatabaseRecordId, GuestDatabaseError>>;
+
+    fn add<'a>(&'a mut self, data: &'a [u8]) -> HostFuture<'a, Result<GuestDatabaseRecordId, GuestDatabaseError>>;
+
+    fn get<'a>(&'a self, id: GuestDatabaseRecordId) -> HostFuture<'a, Result<Option<Vec<u8>>, GuestDatabaseError>>;
+
+    fn set<'a>(
+        &'a mut self,
+        id: GuestDatabaseRecordId,
+        data: &'a [u8],
+    ) -> HostFuture<'a, Result<bool, GuestDatabaseError>>;
+
+    fn delete<'a>(&'a mut self, id: GuestDatabaseRecordId) -> HostFuture<'a, Result<bool, GuestDatabaseError>>;
+
+    fn record_ids<'a>(&'a self) -> HostFuture<'a, Result<Vec<GuestDatabaseRecordId>, GuestDatabaseError>>;
+}
+
+pub trait GuestDatabaseRepositoryHost: Send + Sync {
+    fn open<'a>(
+        &'a self,
+        name: &'a str,
+        app_id: &'a str,
+    ) -> HostFuture<'a, Result<Box<dyn GuestDatabaseHost>, GuestDatabaseError>>;
+
+    fn exists<'a>(&'a self, name: &'a str, app_id: &'a str) -> HostFuture<'a, Result<bool, GuestDatabaseError>>;
+
+    fn delete<'a>(&'a self, name: &'a str, app_id: &'a str) -> HostFuture<'a, Result<bool, GuestDatabaseError>>;
+
+    fn usage<'a>(&'a self, app_id: &'a str) -> HostFuture<'a, Result<u64, GuestDatabaseError>>;
+}
+
 pub trait EmulatorBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
     fn required_host_services(&self) -> &'static [HostServiceKind];
@@ -481,6 +544,113 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct SyntheticDatabase {
+        records: Vec<(GuestDatabaseRecordId, Vec<u8>)>,
+        next: GuestDatabaseRecordId,
+    }
+
+    impl SyntheticDatabase {
+        fn with_seed() -> Self {
+            Self {
+                records: vec![(7, vec![1, 2, 3])],
+                next: 8,
+            }
+        }
+    }
+
+    impl GuestDatabaseHost for SyntheticDatabase {
+        fn next_id<'a>(&'a self) -> HostFuture<'a, Result<GuestDatabaseRecordId, GuestDatabaseError>> {
+            Box::pin(async move { Ok(self.next) })
+        }
+
+        fn add<'a>(&'a mut self, data: &'a [u8]) -> HostFuture<'a, Result<GuestDatabaseRecordId, GuestDatabaseError>> {
+            Box::pin(async move {
+                let id = self.next;
+                self.next += 1;
+                self.records.push((id, data.to_vec()));
+                Ok(id)
+            })
+        }
+
+        fn get<'a>(&'a self, id: GuestDatabaseRecordId) -> HostFuture<'a, Result<Option<Vec<u8>>, GuestDatabaseError>> {
+            Box::pin(async move {
+                Ok(self
+                    .records
+                    .iter()
+                    .find(|(record_id, _)| *record_id == id)
+                    .map(|(_, data)| data.clone()))
+            })
+        }
+
+        fn set<'a>(
+            &'a mut self,
+            id: GuestDatabaseRecordId,
+            data: &'a [u8],
+        ) -> HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                let Some((_, stored)) = self.records.iter_mut().find(|(record_id, _)| *record_id == id) else {
+                    return Ok(false);
+                };
+
+                *stored = data.to_vec();
+                Ok(true)
+            })
+        }
+
+        fn delete<'a>(&'a mut self, id: GuestDatabaseRecordId) -> HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                let before = self.records.len();
+                self.records.retain(|(record_id, _)| *record_id != id);
+                Ok(self.records.len() != before)
+            })
+        }
+
+        fn record_ids<'a>(&'a self) -> HostFuture<'a, Result<Vec<GuestDatabaseRecordId>, GuestDatabaseError>> {
+            Box::pin(async move { Ok(self.records.iter().map(|(record_id, _)| *record_id).collect()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct SyntheticDatabaseRepository;
+
+    impl GuestDatabaseRepositoryHost for SyntheticDatabaseRepository {
+        fn open<'a>(
+            &'a self,
+            name: &'a str,
+            app_id: &'a str,
+        ) -> HostFuture<'a, Result<Box<dyn GuestDatabaseHost>, GuestDatabaseError>> {
+            Box::pin(async move {
+                assert_eq!(name, "records");
+                assert_eq!(app_id, "app-1");
+                Ok(Box::new(SyntheticDatabase::with_seed()) as Box<dyn GuestDatabaseHost>)
+            })
+        }
+
+        fn exists<'a>(&'a self, name: &'a str, app_id: &'a str) -> HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                assert_eq!(name, "records");
+                assert_eq!(app_id, "app-1");
+                Ok(true)
+            })
+        }
+
+        fn delete<'a>(&'a self, name: &'a str, app_id: &'a str) -> HostFuture<'a, Result<bool, GuestDatabaseError>> {
+            Box::pin(async move {
+                assert_eq!(name, "records");
+                assert_eq!(app_id, "app-1");
+                Ok(true)
+            })
+        }
+
+        fn usage<'a>(&'a self, app_id: &'a str) -> HostFuture<'a, Result<u64, GuestDatabaseError>> {
+            Box::pin(async move {
+                assert_eq!(app_id, "app-1");
+                Ok(1_234)
+            })
+        }
+    }
+
     #[test]
     fn api_schema_is_version_one() {
         assert_eq!(EMULATOR_API_SCHEMA_VERSION, 1);
@@ -657,6 +827,71 @@ mod tests {
         );
 
         poll_ready(filesystem.truncate("app-1", "save/state.bin", 3)).expect("truncate must succeed");
+    }
+
+    #[test]
+    fn guest_database_record_id_is_exact_u32() {
+        let record_id: GuestDatabaseRecordId = u32::MAX;
+
+        assert_eq!(record_id, u32::MAX);
+    }
+
+    #[test]
+    fn guest_database_error_keeps_stable_code_and_message() {
+        let error = GuestDatabaseError::operation_failed("synthetic database failure");
+
+        assert_eq!(error.code, GuestDatabaseErrorCode::OperationFailed);
+        assert_eq!(error.message, "synthetic database failure");
+        assert!(error.to_string().contains("OperationFailed"));
+    }
+
+    #[test]
+    fn guest_database_contract_preserves_record_ids_and_bytes() {
+        let mut database = SyntheticDatabase::with_seed();
+
+        assert_eq!(poll_ready(database.next_id()).expect("next_id must succeed"), 8);
+        assert_eq!(
+            poll_ready(database.get(7)).expect("get must succeed"),
+            Some(vec![1, 2, 3])
+        );
+
+        assert!(poll_ready(database.set(7, &[9, 8])).expect("set must succeed"));
+        assert_eq!(
+            poll_ready(database.get(7)).expect("get after set must succeed"),
+            Some(vec![9, 8])
+        );
+
+        let added = poll_ready(database.add(&[4, 5])).expect("add must succeed");
+        assert_eq!(added, 8);
+        assert_eq!(
+            poll_ready(database.record_ids()).expect("record_ids must succeed"),
+            vec![7, 8]
+        );
+
+        assert!(poll_ready(database.delete(7)).expect("delete must succeed"));
+        assert_eq!(
+            poll_ready(database.record_ids()).expect("record_ids after delete must succeed"),
+            vec![8]
+        );
+    }
+
+    #[test]
+    fn guest_database_repository_preserves_name_app_id_and_usage() {
+        let repository: &dyn GuestDatabaseRepositoryHost = &SyntheticDatabaseRepository;
+
+        assert!(poll_ready(repository.exists("records", "app-1")).expect("exists must succeed"));
+        assert_eq!(
+            poll_ready(repository.usage("app-1")).expect("usage must succeed"),
+            1_234
+        );
+
+        let database = poll_ready(repository.open("records", "app-1")).expect("open must succeed");
+        assert_eq!(
+            poll_ready(database.get(7)).expect("opened database get must succeed"),
+            Some(vec![1, 2, 3])
+        );
+
+        assert!(poll_ready(repository.delete("records", "app-1")).expect("delete must succeed"));
     }
 
     #[test]
