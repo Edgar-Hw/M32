@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Local IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Local logs / temporary files
+*.log
+*.tmp
+*.temp
+
+# M32 local runtime data
+/M32-data/

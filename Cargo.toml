@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/m32-desktop",
+    "crates/m32-domain",
+    "crates/m32-ui",
+    "crates/m32-emulator-api",
+    "crates/m32-wie-adapter",
+    "crates/m32-library",
+    "crates/m32-dna",
+    "crates/m32-doctor",
+    "crates/m32-display",
+    "crates/m32-audio",
+    "crates/m32-input",
+    "crates/m32-archive",
+    "crates/m32-timeline",
+    "crates/m32-test-fixtures",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"

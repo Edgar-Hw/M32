@@ -1,0 +1,9 @@
+[package]
+name = "m32-desktop"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "m32"
+path = "src/main.rs"
