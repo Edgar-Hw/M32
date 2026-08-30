@@ -3,6 +3,8 @@
 //! This crate must remain independent from any concrete emulator implementation.
 //! WIE-specific types belong behind `m32-wie-adapter`.
 
+use std::{error::Error, fmt};
+
 pub const EMULATOR_API_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,6 +29,48 @@ pub trait EmulatorBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionState {
+    Ready,
+    Running,
+    Faulted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionErrorCode {
+    BackendTickFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmulatorSessionError {
+    pub code: SessionErrorCode,
+    pub message: String,
+}
+
+impl EmulatorSessionError {
+    #[must_use]
+    pub fn new(code: SessionErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for EmulatorSessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl Error for EmulatorSessionError {}
+
+pub trait EmulatorSession {
+    fn backend(&self) -> BackendDescriptor;
+    fn state(&self) -> SessionState;
+    fn tick(&mut self) -> Result<(), EmulatorSessionError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,6 +80,25 @@ mod tests {
     impl EmulatorBackend for SyntheticBackend {
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor::new("synthetic", "Synthetic Backend", "test-revision")
+        }
+    }
+
+    struct SyntheticSession {
+        state: SessionState,
+    }
+
+    impl EmulatorSession for SyntheticSession {
+        fn backend(&self) -> BackendDescriptor {
+            BackendDescriptor::new("synthetic", "Synthetic Backend", "test-revision")
+        }
+
+        fn state(&self) -> SessionState {
+            self.state
+        }
+
+        fn tick(&mut self) -> Result<(), EmulatorSessionError> {
+            self.state = SessionState::Running;
+            Ok(())
         }
     }
 
@@ -61,5 +124,35 @@ mod tests {
         assert_eq!(descriptor.id, "synthetic");
         assert_eq!(descriptor.display_name, "Synthetic Backend");
         assert_eq!(descriptor.upstream_revision, "test-revision");
+    }
+
+    #[test]
+    fn session_state_contract_is_explicit() {
+        assert_ne!(SessionState::Ready, SessionState::Running);
+        assert_ne!(SessionState::Running, SessionState::Faulted);
+        assert_ne!(SessionState::Ready, SessionState::Faulted);
+    }
+
+    #[test]
+    fn session_error_keeps_stable_code_and_message() {
+        let error = EmulatorSessionError::new(SessionErrorCode::BackendTickFailed, "synthetic failure");
+
+        assert_eq!(error.code, SessionErrorCode::BackendTickFailed);
+        assert_eq!(error.message, "synthetic failure");
+        assert!(error.to_string().contains("BackendTickFailed"));
+    }
+
+    #[test]
+    fn session_trait_is_implementation_agnostic() {
+        let mut session = SyntheticSession {
+            state: SessionState::Ready,
+        };
+
+        assert_eq!(session.state(), SessionState::Ready);
+        assert_eq!(session.backend().id, "synthetic");
+
+        session.tick().expect("synthetic tick must succeed");
+
+        assert_eq!(session.state(), SessionState::Running);
     }
 }
