@@ -8,4 +8,5 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+m32-emulator-api = { path = "../m32-emulator-api" }
 wie_backend.workspace = true

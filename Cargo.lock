@@ -276,6 +276,7 @@ version = "0.0.0"
 name = "m32-wie-adapter"
 version = "0.0.0"
 dependencies = [
+ "m32-emulator-api",
  "wie_backend",
 ]
 
