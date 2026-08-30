@@ -907,7 +907,7 @@ mod tests {
                     .lock()
                     .expect("filesystem calls mutex poisoned")
                     .push(format!("size:{aid}:{path}"));
-                Ok(Some(6))
+                Ok((path == "save/state.bin").then_some(6))
             })
         }
 
@@ -924,6 +924,10 @@ mod tests {
                     .lock()
                     .expect("filesystem calls mutex poisoned")
                     .push(format!("read:{aid}:{path}:{offset}:{count}"));
+
+                if path != "save/state.bin" {
+                    return Ok(None);
+                }
 
                 let source = b"abcdef";
                 if offset >= source.len() {
@@ -1110,6 +1114,39 @@ mod tests {
         assert_eq!(
             *host.calls.lock().expect("filesystem calls mutex poisoned"),
             vec!["exists:game.aid:save/state.bin", "size:game.aid:save/state.bin"]
+        );
+    }
+
+    #[test]
+    fn recording_filesystem_does_not_claim_unknown_virtual_archive_paths() {
+        let host = Arc::new(RecordingFilesystemHost::default());
+        let filesystem = WieFilesystemAdapter::new(host);
+
+        assert!(!block_on_ready(wie_backend::Filesystem::exists(
+            &filesystem,
+            "M32 Running Smoke",
+            "j2me-first-frame-running.jar"
+        )));
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::size(
+                &filesystem,
+                "M32 Running Smoke",
+                "j2me-first-frame-running.jar"
+            )),
+            None
+        );
+
+        let mut buffer = [0_u8; 8];
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::read(
+                &filesystem,
+                "M32 Running Smoke",
+                "j2me-first-frame-running.jar",
+                0,
+                buffer.len(),
+                &mut buffer,
+            )),
+            None
         );
     }
 
@@ -1822,17 +1859,28 @@ mod tests {
         );
     }
 
-    fn recording_platform_hosts() -> WiePlatformHosts {
+    fn recording_platform_hosts_with_observers(
+        output: Arc<RecordingOutput>,
+        filesystem: Arc<RecordingFilesystemHost>,
+    ) -> WiePlatformHosts {
         WiePlatformHosts {
             display: Arc::new(RecordingDisplayHost::default()),
             clock: Arc::new(FixedClock(1_725_123_456_789)),
             database: Arc::new(RecordingDatabaseRepository::default()),
-            filesystem: Arc::new(RecordingFilesystemHost::default()),
+            filesystem,
             audio: Arc::new(RecordingAudioHost::default()),
-            output: Arc::new(RecordingOutput::default()),
+            output,
             exit: Arc::new(RecordingExit::default()),
             vibration: Arc::new(RecordingVibration::default()),
         }
+    }
+
+    fn recording_platform_hosts_with_output(output: Arc<RecordingOutput>) -> WiePlatformHosts {
+        recording_platform_hosts_with_observers(output, Arc::new(RecordingFilesystemHost::default()))
+    }
+
+    fn recording_platform_hosts() -> WiePlatformHosts {
+        recording_platform_hosts_with_output(Arc::new(RecordingOutput::default()))
     }
 
     #[test]
@@ -1918,6 +1966,120 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
 
         assert_eq!(session.backend(), wie_backend_descriptor());
         assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    const FIRST_FRAME_RUNNING_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-first-frame-running.jad");
+    const FIRST_FRAME_RUNNING_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-first-frame-running.jar");
+    const FIRST_FRAME_BOOT_SENTINEL: &[u8] = b"M32_FIRST_FRAME_BOOT_OK";
+    const FIRST_FRAME_BOOT_MAX_TICKS: usize = 512;
+
+    #[test]
+    fn first_frame_running_fixture_contains_start_app_sentinel() {
+        assert!(contains_bytes(
+            FIRST_FRAME_RUNNING_JAD,
+            b"MIDlet-1: M32 Running,,m32.RunningMidlet"
+        ));
+        assert!(contains_bytes(FIRST_FRAME_RUNNING_JAR, b"m32/RunningMidlet.class"));
+        assert!(contains_bytes(FIRST_FRAME_RUNNING_JAR, b"M32_FIRST_FRAME_BOOT_OK"));
+    }
+
+    #[test]
+    fn first_frame_running_jar_round_trips_through_real_wie_overlay() {
+        let output = Arc::new(RecordingOutput::default());
+        let filesystem = Arc::new(RecordingFilesystemHost::default());
+        let hosts = recording_platform_hosts_with_observers(output, filesystem.clone());
+
+        let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+        let system = wie_backend::System::new(
+            platform,
+            "M32 Running Smoke",
+            "M32 Running Smoke",
+            wie_backend::DefaultTaskRunner,
+        );
+
+        system
+            .filesystem()
+            .add_virtual("j2me-first-frame-running.jar", FIRST_FRAME_RUNNING_JAR.to_vec());
+
+        assert!(block_on_ready(
+            system.filesystem().exists("j2me-first-frame-running.jar")
+        ));
+        assert_eq!(
+            block_on_ready(system.filesystem().size("j2me-first-frame-running.jar")),
+            Some(FIRST_FRAME_RUNNING_JAR.len())
+        );
+
+        let mut bytes = vec![0_u8; FIRST_FRAME_RUNNING_JAR.len()];
+        assert_eq!(
+            block_on_ready(
+                system
+                    .filesystem()
+                    .read("j2me-first-frame-running.jar", 0, bytes.len(), &mut bytes,)
+            ),
+            Some(FIRST_FRAME_RUNNING_JAR.len())
+        );
+        assert_eq!(bytes, FIRST_FRAME_RUNNING_JAR);
+
+        assert_eq!(
+            *filesystem.calls.lock().expect("filesystem calls mutex poisoned"),
+            vec![
+                "exists:M32 Running Smoke:j2me-first-frame-running.jar",
+                "size:M32 Running Smoke:j2me-first-frame-running.jar",
+                "exists:M32 Running Smoke:j2me-first-frame-running.jar",
+            ]
+        );
+    }
+
+    #[test]
+    fn first_frame_running_fixture_executes_start_app_and_reaches_running() {
+        let output = Arc::new(RecordingOutput::default());
+        let filesystem = Arc::new(RecordingFilesystemHost::default());
+        let hosts = recording_platform_hosts_with_observers(output.clone(), filesystem.clone());
+
+        let mut session = create_j2me_jad_jar_session(
+            hosts,
+            FIRST_FRAME_RUNNING_JAD.to_vec(),
+            "j2me-first-frame-running.jar".to_owned(),
+            FIRST_FRAME_RUNNING_JAR.to_vec(),
+        )
+        .expect("running fixture must construct a Ready J2ME session");
+
+        assert_eq!(session.state(), SessionState::Ready);
+
+        for _ in 0..FIRST_FRAME_BOOT_MAX_TICKS {
+            if let Err(error) = session.tick() {
+                let calls = filesystem
+                    .calls
+                    .lock()
+                    .expect("filesystem calls mutex poisoned")
+                    .clone();
+                panic!("running fixture faulted while booting: {error:?}; filesystem calls: {calls:?}");
+            }
+
+            let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+            if contains_bytes(&stdout, FIRST_FRAME_BOOT_SENTINEL) {
+                assert_eq!(session.state(), SessionState::Running);
+                drop(stdout);
+
+                let calls = filesystem.calls.lock().expect("filesystem calls mutex poisoned");
+                assert!(
+                    calls
+                        .iter()
+                        .any(|call| call == "size:M32 Running Smoke:j2me-first-frame-running.jar"),
+                    "system URLClassLoader must query the guest JAR through WIE runtime metadata: {calls:?}"
+                );
+                return;
+            }
+        }
+
+        let calls = filesystem
+            .calls
+            .lock()
+            .expect("filesystem calls mutex poisoned")
+            .clone();
+        panic!(
+            "startApp sentinel was not observed within {FIRST_FRAME_BOOT_MAX_TICKS} ticks; filesystem calls: {calls:?}"
+        );
     }
 
     #[test]

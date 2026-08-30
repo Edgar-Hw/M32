@@ -1156,6 +1156,17 @@ impl Jvm {
 
             let calling_class_class_loader = JavaLangClass::class_loader(self, &class.java_class()).await?;
             if let Some(x) = calling_class_class_loader {
+                // M32 compatibility: RustJar callers resolve application classes through the system loader.
+                //
+                // The system loader is URLClassLoader(parent = RustJarClassLoader). A native RustJar
+                // class such as net/wie/Launcher must therefore use the system loader when resolving
+                // an application JAR class. Otherwise the current RustJarClassLoader skips every
+                // non-.rustjar classpath entry and guest classes are never queried from the JAR.
+                if x.class_definition().name() == "org/rustjava/lang/RustJarClassLoader" {
+                    let system_class_loader = JavaLangClassLoader::get_system_class_loader(self).await?;
+                    return Ok(system_class_loader);
+                }
+
                 Ok(x)
             } else {
                 let system_class_loader = JavaLangClassLoader::get_system_class_loader(self).await?;
