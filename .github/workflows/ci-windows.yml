@@ -54,21 +54,21 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $components = rustup component list --installed
-          $targets = rustup target list --installed
+          $components = @(rustup component list --installed)
+          $targets = @(rustup target list --installed)
 
           $components
           $targets
 
-          if ($components -notmatch 'rustfmt-x86_64-pc-windows-msvc') {
+          if ($components -notcontains 'rustfmt-x86_64-pc-windows-msvc') {
             throw "rustfmt component is missing."
           }
 
-          if ($components -notmatch 'clippy-x86_64-pc-windows-msvc') {
+          if ($components -notcontains 'clippy-x86_64-pc-windows-msvc') {
             throw "clippy component is missing."
           }
 
-          if ($targets -notmatch 'x86_64-pc-windows-msvc') {
+          if ($targets -notcontains 'x86_64-pc-windows-msvc') {
             throw "x86_64-pc-windows-msvc target is missing."
           }
 
