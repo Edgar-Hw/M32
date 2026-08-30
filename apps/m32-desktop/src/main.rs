@@ -1,8 +1,11 @@
+mod crash;
 mod logging;
 
 use m32_domain::BuildInfo;
 
 fn main() {
+    crash::install();
+
     if let Err(error) = logging::init() {
         eprintln!("M32 logging initialization failed: {error}");
         std::process::exit(1);
@@ -23,4 +26,6 @@ fn main() {
         build_profile = info.build_profile,
         "M32 application started"
     );
+
+    crash::trigger_smoke_test_if_requested();
 }
