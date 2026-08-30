@@ -1,0 +1,100 @@
+name: M32 Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m32-windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Rust 1.98.0 / Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify pinned Rust toolchain
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rustcVersion = rustc --version
+          $cargoVersion = cargo --version
+          $activeToolchain = rustup show active-toolchain
+
+          Write-Host $rustcVersion
+          Write-Host $cargoVersion
+          Write-Host $activeToolchain
+
+          if ($rustcVersion -notmatch '^rustc 1\.98\.0 ') {
+            throw "Expected rustc 1.98.0, got: $rustcVersion"
+          }
+
+          if ($cargoVersion -notmatch '^cargo 1\.98\.0 ') {
+            throw "Expected cargo 1.98.0, got: $cargoVersion"
+          }
+
+          if ($activeToolchain -notmatch '^1\.98\.0-x86_64-pc-windows-msvc') {
+            throw "Expected 1.98.0-x86_64-pc-windows-msvc, got: $activeToolchain"
+          }
+
+      - name: Verify required components and target
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $components = rustup component list --installed
+          $targets = rustup target list --installed
+
+          $components
+          $targets
+
+          if ($components -notmatch 'rustfmt-x86_64-pc-windows-msvc') {
+            throw "rustfmt component is missing."
+          }
+
+          if ($components -notmatch 'clippy-x86_64-pc-windows-msvc') {
+            throw "clippy component is missing."
+          }
+
+          if ($targets -notmatch 'x86_64-pc-windows-msvc') {
+            throw "x86_64-pc-windows-msvc target is missing."
+          }
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Self-check formatting gate
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP "m32-format-failure-probe.rs"
+          'fn main(){println!("format-gate-probe");}' | Set-Content -Path $probe -Encoding utf8
+
+          rustfmt --edition 2024 --check $probe
+          $probeExit = $LASTEXITCODE
+
+          if ($probeExit -eq 0) {
+            throw "Formatting gate self-check failed: malformed probe unexpectedly passed."
+          }
+
+          Write-Host "Expected formatting failure reproduced successfully. Exit code: $probeExit"
+          exit 0
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Check workspace
+        run: cargo check --workspace
