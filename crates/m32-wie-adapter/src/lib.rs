@@ -2365,6 +2365,79 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
     }
 
     #[test]
+    fn first_frame_paint_fixture_locks_exact_rgba8_dimensions_and_content() {
+        const WIDTH: usize = 176;
+        const HEIGHT: usize = 220;
+        const BYTES_PER_PIXEL: usize = 4;
+        const MARKER_WIDTH: usize = 16;
+        const MARKER_HEIGHT: usize = 16;
+        const BG0: [u8; 4] = [0x0E, 0x11, 0x14, 0xFF];
+        const RED: [u8; 4] = [0xD1, 0x4A, 0x36, 0xFF];
+
+        let display = Arc::new(FirstFrameCaptureDisplayHost::default());
+        display
+            .resize(DisplaySize::new(WIDTH as u32, HEIGHT as u32))
+            .expect("T007 logical screen size must be accepted");
+
+        let output = Arc::new(RecordingOutput::default());
+        let hosts = WiePlatformHosts {
+            display: display.clone(),
+            clock: Arc::new(DeterministicAdvancingClock::new(1_725_123_456_789, 1)),
+            database: Arc::new(RecordingDatabaseRepository::default()),
+            filesystem: Arc::new(RecordingFilesystemHost::default()),
+            audio: Arc::new(RecordingAudioHost::default()),
+            output,
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        };
+
+        let mut session = create_first_frame_paint_wie_session(hosts)
+            .expect("T007 paint fixture must construct a concrete WIE session");
+
+        let frame = tick_until_first_captured_frame(&mut session, &display, FIRST_FRAME_CAPTURE_MAX_TICKS);
+
+        assert_eq!(frame.size, DisplaySize::new(WIDTH as u32, HEIGHT as u32));
+        assert_eq!(frame.pixels.len(), WIDTH * HEIGHT * BYTES_PER_PIXEL);
+
+        let (pixels, remainder) = frame.pixels.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        assert_eq!(pixels.len(), WIDTH * HEIGHT);
+
+        let mut red_pixels = 0_usize;
+        let mut bg0_pixels = 0_usize;
+
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let pixel = pixels[y * WIDTH + x];
+                let expected = if x < MARKER_WIDTH && y < MARKER_HEIGHT {
+                    red_pixels += 1;
+                    RED
+                } else {
+                    bg0_pixels += 1;
+                    BG0
+                };
+
+                assert_eq!(pixel, expected, "unexpected T007 pixel at ({x}, {y})");
+            }
+        }
+
+        assert_eq!(red_pixels, MARKER_WIDTH * MARKER_HEIGHT);
+        assert_eq!(bg0_pixels, WIDTH * HEIGHT - MARKER_WIDTH * MARKER_HEIGHT);
+
+        assert_eq!(pixels[0], RED);
+        assert_eq!(pixels[15], RED);
+        assert_eq!(pixels[15 * WIDTH], RED);
+        assert_eq!(pixels[15 * WIDTH + 15], RED);
+
+        assert_eq!(pixels[16], BG0);
+        assert_eq!(pixels[16 * WIDTH], BG0);
+        assert_eq!(pixels[WIDTH * HEIGHT - 1], BG0);
+
+        assert_eq!(session.state(), SessionState::Running);
+        assert_eq!(display.first_frame(), Some(frame));
+    }
+
+    #[test]
     fn session_create_error_maps_to_stable_m32_code() {
         let error = map_session_create_error("synthetic constructor failure");
 
