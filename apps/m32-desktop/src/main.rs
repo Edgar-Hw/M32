@@ -1,4 +1,5 @@
 mod crash;
+mod desktop;
 mod logging;
 mod paths;
 
@@ -11,7 +12,6 @@ fn main() {
         eprintln!("M32 logging initialization failed: {error}");
         std::process::exit(1);
     }
-
     let paths = match paths::AppPaths::discover() {
         Ok(paths) => paths,
         Err(error) => {
@@ -24,7 +24,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-
     if let Err(error) = paths.ensure_directories() {
         tracing::error!(
             target: "m32::storage",
@@ -36,7 +35,6 @@ fn main() {
     }
 
     let info = BuildInfo::current();
-
     tracing::info!(
         target: "m32::lifecycle",
         event = "app_start",
@@ -50,7 +48,6 @@ fn main() {
         build_profile = info.build_profile,
         "M32 application started"
     );
-
     tracing::debug!(
         target: "m32::storage",
         event = "runtime_paths_ready",
@@ -58,4 +55,15 @@ fn main() {
     );
 
     crash::trigger_smoke_test_if_requested();
+
+    if let Err(error) = desktop::run() {
+        tracing::error!(
+            target: "m32::lifecycle",
+            event = "desktop_runtime_failed",
+            error = %error,
+            "M32 desktop runtime exited with an error"
+        );
+        eprintln!("M32 desktop runtime failed: {error}");
+        std::process::exit(3);
+    }
 }

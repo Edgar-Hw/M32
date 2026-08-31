@@ -25,8 +25,14 @@ edition = "2024"
 
 [workspace.dependencies]
 async-trait = "=0.1.92"
+egui = "=0.36.1"
+egui-wgpu = { version = "=0.36.1", features = ["winit"] }
+egui-winit = "=0.36.1"
+pollster = "=0.4.0"
 tracing = "=0.1.41"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+wgpu = "=30.0.1"
+winit = "=0.30.13"
 wie_backend = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_backend" }
 wie_j2me = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_j2me" }
 wie_util = { git = "https://github.com/dlunch/wie.git", rev = "f0513eb758c02736981f545ad030eed937d55f3e", package = "wie_util" }
