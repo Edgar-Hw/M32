@@ -7,6 +7,7 @@ members = [
     "crates/m32-emulator-api",
     "crates/m32-wie-adapter",
     "crates/m32-library",
+    "crates/m32-storage",
     "crates/m32-dna",
     "crates/m32-doctor",
     "crates/m32-display",
