@@ -1,0 +1,4 @@
+MIDlet-Name: M32 Input Key Observer
+MIDlet-Version: 1.0.0
+MIDlet-Vendor: M32
+MIDlet-1: M32 Input,,m32.KeyMidlet

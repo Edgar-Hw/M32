@@ -2257,6 +2257,14 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
     const FIRST_FRAME_CANVAS_READY_SENTINEL: &[u8] = b"M32_FIRST_FRAME_CANVAS_READY";
     const FIRST_FRAME_CAPTURE_MAX_TICKS: usize = 512;
 
+    const INPUT_KEY_OBSERVER_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-input-key-observer.jad");
+    const INPUT_KEY_OBSERVER_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-input-key-observer.jar");
+    const INPUT_KEY_MIDLET_SOURCE: &str = include_str!("../test-fixtures/src/m32/KeyMidlet.java");
+    const INPUT_KEY_CANVAS_SOURCE: &str = include_str!("../test-fixtures/src/m32/KeyCanvas.java");
+    const INPUT_CANVAS_STUB_SOURCE: &str = include_str!("../test-fixtures/src/javax/microedition/lcdui/Canvas.java");
+    const INPUT_KEY_READY_SENTINEL: &[u8] = b"M32_KEY_CANVAS_READY;";
+    const INPUT_KEY_MAX_TICKS: usize = 512;
+
     fn create_first_frame_paint_wie_session(hosts: WiePlatformHosts) -> Result<WieSession, EmulatorSessionCreateError> {
         let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
 
@@ -2265,6 +2273,25 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
             FIRST_FRAME_PAINT_JAD.to_vec(),
             "j2me-first-frame-paint.jar".to_owned(),
             FIRST_FRAME_PAINT_JAR.to_vec(),
+        )
+        .map_err(map_session_create_error)?;
+
+        Ok(WieSession {
+            emulator: Box::new(emulator),
+            state: SessionState::Ready,
+        })
+    }
+
+    fn create_input_key_observer_wie_session(
+        hosts: WiePlatformHosts,
+    ) -> Result<WieSession, EmulatorSessionCreateError> {
+        let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+        let emulator = wie_j2me::J2MEEmulator::from_jad_jar(
+            platform,
+            INPUT_KEY_OBSERVER_JAD.to_vec(),
+            "j2me-input-key-observer.jar".to_owned(),
+            INPUT_KEY_OBSERVER_JAR.to_vec(),
         )
         .map_err(map_session_create_error)?;
 
@@ -2379,6 +2406,64 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
                 );
             }
         }
+    }
+
+    fn create_running_input_key_test_session() -> (WieSession, Arc<FirstFrameCaptureDisplayHost>, Arc<RecordingOutput>)
+    {
+        let display = Arc::new(FirstFrameCaptureDisplayHost::default());
+        display
+            .resize(DisplaySize::new(176, 220))
+            .expect("input fixture logical screen size must be accepted");
+
+        let output = Arc::new(RecordingOutput::default());
+        let hosts = WiePlatformHosts {
+            display: display.clone(),
+            clock: Arc::new(DeterministicAdvancingClock::new(1_725_123_456_789, 1)),
+            database: Arc::new(RecordingDatabaseRepository::default()),
+            filesystem: Arc::new(RecordingFilesystemHost::default()),
+            audio: Arc::new(RecordingAudioHost::default()),
+            output: output.clone(),
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        };
+
+        let mut session = create_input_key_observer_wie_session(hosts)
+            .expect("input key observer fixture must construct a WIE session");
+
+        assert_eq!(session.state(), SessionState::Ready);
+        let _ = tick_until_first_captured_frame(&mut session, &display, INPUT_KEY_MAX_TICKS);
+        assert_eq!(session.state(), SessionState::Running);
+
+        let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+        assert!(contains_bytes(&stdout, INPUT_KEY_READY_SENTINEL));
+        drop(stdout);
+
+        (session, display, output)
+    }
+
+    fn tick_until_stdout_contains(
+        session: &mut WieSession,
+        output: &RecordingOutput,
+        token: &[u8],
+        max_ticks: usize,
+    ) -> usize {
+        for tick in 1..=max_ticks {
+            session
+                .tick()
+                .expect("input observer fixture must not fault while dispatching a key event");
+
+            let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+            if contains_bytes(&stdout, token) {
+                return tick;
+            }
+        }
+
+        let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+        panic!(
+            "guest key callback token was not observed within {max_ticks} ticks; token={:?}; stdout={:?}",
+            String::from_utf8_lossy(token),
+            String::from_utf8_lossy(&stdout),
+        );
     }
 
     fn write_first_frame_preview_bmp(path: &std::path::Path, frame: &RgbaFrame) -> std::io::Result<()> {
@@ -2512,6 +2597,105 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
 
         let stdout = output.stdout.lock().expect("stdout mutex poisoned");
         assert!(contains_bytes(&stdout, FIRST_FRAME_CANVAS_READY_SENTINEL));
+    }
+
+    #[test]
+    fn input_key_observer_fixture_locks_guest_callback_contract() {
+        assert!(INPUT_KEY_OBSERVER_JAR.starts_with(b"PK\x03\x04"));
+        assert!(contains_bytes(
+            INPUT_KEY_OBSERVER_JAD,
+            b"MIDlet-1: M32 Input,,m32.KeyMidlet"
+        ));
+        assert!(contains_bytes(INPUT_KEY_OBSERVER_JAR, b"m32/KeyMidlet.class"));
+        assert!(contains_bytes(INPUT_KEY_OBSERVER_JAR, b"m32/KeyCanvas.class"));
+        assert!(contains_bytes(INPUT_KEY_OBSERVER_JAR, b"M32_KEY_CANVAS_READY;"));
+        assert!(contains_bytes(INPUT_KEY_OBSERVER_JAR, b"M32_KEY_PRESSED:"));
+        assert!(contains_bytes(INPUT_KEY_OBSERVER_JAR, b"M32_KEY_RELEASED:"));
+        assert!(contains_bytes(INPUT_KEY_OBSERVER_JAR, b"M32_KEY_REPEATED:"));
+
+        assert!(INPUT_KEY_MIDLET_SOURCE.contains("Display.getDisplay(this).setCurrent(new KeyCanvas());"));
+        assert!(INPUT_KEY_CANVAS_SOURCE.contains("protected void keyPressed(int keyCode)"));
+        assert!(INPUT_KEY_CANVAS_SOURCE.contains("protected void keyReleased(int keyCode)"));
+        assert!(INPUT_KEY_CANVAS_SOURCE.contains("protected void keyRepeated(int keyCode)"));
+
+        assert!(INPUT_CANVAS_STUB_SOURCE.contains("protected void keyPressed(int keyCode)"));
+        assert!(INPUT_CANVAS_STUB_SOURCE.contains("protected void keyReleased(int keyCode)"));
+        assert!(INPUT_CANVAS_STUB_SOURCE.contains("protected void keyRepeated(int keyCode)"));
+    }
+
+    #[test]
+    fn input_key_observer_fixture_constructs_ready_j2me_session() {
+        let session = create_input_key_observer_wie_session(recording_platform_hosts())
+            .expect("deterministic input observer fixture must construct a Ready session");
+
+        assert_eq!(session.backend(), wie_backend_descriptor());
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    #[test]
+    fn input_key_down_reaches_real_canvas_key_pressed() {
+        let (mut session, _display, output) = create_running_input_key_test_session();
+
+        session.handle_input(GuestInputEvent::KeyDown(M32Key::Up));
+
+        tick_until_stdout_contains(&mut session, &output, b"M32_KEY_PRESSED:141;", INPUT_KEY_MAX_TICKS);
+
+        assert_eq!(session.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn input_key_up_and_repeat_reach_real_canvas_callbacks() {
+        let (mut session, _display, output) = create_running_input_key_test_session();
+
+        session.handle_input(GuestInputEvent::KeyUp(M32Key::LeftSoft));
+        tick_until_stdout_contains(&mut session, &output, b"M32_KEY_RELEASED:6;", INPUT_KEY_MAX_TICKS);
+
+        session.handle_input(GuestInputEvent::KeyRepeat(M32Key::Num7));
+        tick_until_stdout_contains(&mut session, &output, b"M32_KEY_REPEATED:55;", INPUT_KEY_MAX_TICKS);
+
+        assert_eq!(session.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn input_all_24_keys_reach_real_canvas_with_exact_midp_codes() {
+        let (mut session, _display, output) = create_running_input_key_test_session();
+
+        let cases = [
+            (M32Key::Up, 141),
+            (M32Key::Down, 146),
+            (M32Key::Left, 142),
+            (M32Key::Right, 145),
+            (M32Key::Ok, 148),
+            (M32Key::LeftSoft, 6),
+            (M32Key::RightSoft, 7),
+            (M32Key::Clear, 8),
+            (M32Key::Call, 10),
+            (M32Key::Hangup, -1),
+            (M32Key::VolumeUp, 13),
+            (M32Key::VolumeDown, 14),
+            (M32Key::Num0, 48),
+            (M32Key::Num1, 49),
+            (M32Key::Num2, 50),
+            (M32Key::Num3, 51),
+            (M32Key::Num4, 52),
+            (M32Key::Num5, 53),
+            (M32Key::Num6, 54),
+            (M32Key::Num7, 55),
+            (M32Key::Num8, 56),
+            (M32Key::Num9, 57),
+            (M32Key::Hash, 35),
+            (M32Key::Star, 42),
+        ];
+
+        assert_eq!(cases.len(), M32Key::ALL.len());
+
+        for (key, midp_code) in cases {
+            session.handle_input(GuestInputEvent::KeyDown(key));
+            let token = format!("M32_KEY_PRESSED:{midp_code};");
+            tick_until_stdout_contains(&mut session, &output, token.as_bytes(), INPUT_KEY_MAX_TICKS);
+        }
+
+        assert_eq!(session.state(), SessionState::Running);
     }
 
     #[test]
