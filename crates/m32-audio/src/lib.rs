@@ -1,11 +1,17 @@
 //! Deterministic M32 audio core.
 //!
 //! This crate owns backend-independent audio transformation and buffering policy.
-//! OS/device output is intentionally introduced in a later Audio bundle.
+//! Bundle B adds deterministic sequence rendering and the Windows CPAL output boundary.
 
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    sync::{Arc, Mutex},
+};
 
-use m32_emulator_api::{GuestAudioCommand, GuestAudioHost, GuestAudioHostError};
+use m32_emulator_api::{
+    GuestAudioCommand, GuestAudioEventData, GuestAudioHost, GuestAudioHostError, GuestAudioSequence,
+};
 
 pub const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const OUTPUT_CHANNELS: u8 = 2;
@@ -197,6 +203,626 @@ impl GuestAudioHost for BufferedGuestAudioHost {
             .push_back(command);
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioRuntimeError {
+    Transform(AudioTransformError),
+    MutexPoisoned,
+}
+
+impl fmt::Display for AudioRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transform(error) => write!(formatter, "audio transform failed: {error:?}"),
+            Self::MutexPoisoned => write!(formatter, "audio runtime mutex poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for AudioRuntimeError {}
+
+impl From<AudioTransformError> for AudioRuntimeError {
+    fn from(error: AudioTransformError) -> Self {
+        Self::Transform(error)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedWave {
+    start_frame: usize,
+    frames: Vec<StereoFrame>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedMidi {
+    frame: usize,
+    order: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSequence {
+    duration_frames: usize,
+    waves: Vec<PreparedWave>,
+    midi: Vec<PreparedMidi>,
+}
+
+impl PreparedSequence {
+    fn from_guest(sequence: &GuestAudioSequence) -> Result<Self, AudioTransformError> {
+        let mut waves = Vec::new();
+        let mut midi = Vec::new();
+        let mut max_frame = millis_to_frames(sequence.duration);
+
+        for (order, event) in sequence.events.iter().enumerate() {
+            let start_frame = millis_to_frames(event.time);
+            match &event.data {
+                GuestAudioEventData::Wave {
+                    channels,
+                    sampling_rate,
+                    samples,
+                } => {
+                    let frames = canonicalize_wave_to_output(*channels, *sampling_rate, samples)?;
+                    max_frame = max_frame.max(start_frame.saturating_add(frames.len()));
+                    waves.push(PreparedWave { start_frame, frames });
+                }
+                GuestAudioEventData::Midi(bytes) => {
+                    max_frame = max_frame.max(start_frame.saturating_add(1));
+                    midi.push(PreparedMidi {
+                        frame: start_frame,
+                        order,
+                        bytes: bytes.clone(),
+                    });
+                }
+            }
+        }
+
+        midi.sort_by_key(|event| (event.frame, event.order));
+
+        Ok(Self {
+            duration_frames: max_frame.max(1),
+            waves,
+            midi,
+        })
+    }
+}
+
+fn millis_to_frames(milliseconds: u64) -> usize {
+    let frames = milliseconds.saturating_mul(u64::from(OUTPUT_SAMPLE_RATE_HZ)) / 1_000;
+    usize::try_from(frames).unwrap_or(usize::MAX)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MidiNote {
+    phase: f32,
+    phase_step: f32,
+    amplitude: f32,
+}
+
+#[derive(Debug, Clone)]
+struct Voice {
+    sequence: PreparedSequence,
+    repeat: bool,
+    position: usize,
+    midi_cursor: usize,
+    midi_notes: BTreeMap<(u8, u8), MidiNote>,
+    finished: bool,
+}
+
+impl Voice {
+    fn new(sequence: PreparedSequence, repeat: bool) -> Self {
+        Self {
+            sequence,
+            repeat,
+            position: 0,
+            midi_cursor: 0,
+            midi_notes: BTreeMap::new(),
+            finished: false,
+        }
+    }
+
+    fn render_frame(&mut self) -> StereoFrame {
+        if self.finished {
+            return StereoFrame::SILENCE;
+        }
+
+        self.apply_midi_events_at_current_frame();
+
+        let mut frame = StereoFrame::SILENCE;
+        for wave in &self.sequence.waves {
+            if self.position < wave.start_frame {
+                continue;
+            }
+
+            let local = self.position - wave.start_frame;
+            if let Some(sample) = wave.frames.get(local) {
+                frame.left += sample.left;
+                frame.right += sample.right;
+            }
+        }
+
+        let midi_sample = self.render_midi_sample();
+        frame.left += midi_sample;
+        frame.right += midi_sample;
+        frame.left = frame.left.clamp(-1.0, 1.0);
+        frame.right = frame.right.clamp(-1.0, 1.0);
+
+        self.position = self.position.saturating_add(1);
+        if self.position >= self.sequence.duration_frames {
+            if self.repeat {
+                self.position = 0;
+                self.midi_cursor = 0;
+                self.midi_notes.clear();
+            } else {
+                self.finished = true;
+            }
+        }
+
+        frame
+    }
+
+    fn apply_midi_events_at_current_frame(&mut self) {
+        while let Some(event) = self.sequence.midi.get(self.midi_cursor) {
+            if event.frame != self.position {
+                break;
+            }
+
+            apply_midi_message(&mut self.midi_notes, &event.bytes);
+            self.midi_cursor += 1;
+        }
+    }
+
+    fn render_midi_sample(&mut self) -> f32 {
+        let mut sample = 0.0_f32;
+        for note in self.midi_notes.values_mut() {
+            sample += note.phase.sin() * note.amplitude;
+            note.phase += note.phase_step;
+            if note.phase >= std::f32::consts::TAU {
+                note.phase -= std::f32::consts::TAU;
+            }
+        }
+        sample.clamp(-1.0, 1.0)
+    }
+}
+
+fn apply_midi_message(notes: &mut BTreeMap<(u8, u8), MidiNote>, bytes: &[u8]) {
+    let Some(&status) = bytes.first() else {
+        return;
+    };
+
+    let message = status & 0xF0;
+    let channel = status & 0x0F;
+
+    match message {
+        0x80 if bytes.len() >= 3 => {
+            notes.remove(&(channel, bytes[1]));
+        }
+        0x90 if bytes.len() >= 3 => {
+            let note = bytes[1];
+            let velocity = bytes[2];
+            if velocity == 0 {
+                notes.remove(&(channel, note));
+                return;
+            }
+
+            let semitones = (f32::from(note) - 69.0) / 12.0;
+            let frequency_hz = 440.0 * 2.0_f32.powf(semitones);
+            let phase_step = std::f32::consts::TAU * frequency_hz / OUTPUT_SAMPLE_RATE_HZ as f32;
+            let amplitude = f32::from(velocity) / 127.0 * 0.15;
+            notes.insert(
+                (channel, note),
+                MidiNote {
+                    phase: 0.0,
+                    phase_step,
+                    amplitude,
+                },
+            );
+        }
+        0xB0 if bytes.len() >= 3 && matches!(bytes[1], 120 | 123) => {
+            notes.retain(|(note_channel, _), _| *note_channel != channel);
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PauseEnvelope {
+    paused: bool,
+    gain: f32,
+    target: f32,
+    remaining: usize,
+}
+
+impl Default for PauseEnvelope {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            gain: 1.0,
+            target: 1.0,
+            remaining: 0,
+        }
+    }
+}
+
+impl PauseEnvelope {
+    fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused && self.remaining == 0 {
+            return;
+        }
+
+        self.paused = paused;
+        self.target = if paused { 0.0 } else { 1.0 };
+        self.remaining = PAUSE_FADE_FRAMES;
+    }
+
+    fn next_gain(&mut self) -> f32 {
+        let gain = self.gain;
+        if self.remaining > 0 {
+            let step = (self.target - self.gain) / self.remaining as f32;
+            self.gain += step;
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                self.gain = self.target;
+            }
+        }
+        gain
+    }
+
+    fn is_fully_paused(&self) -> bool {
+        self.paused && self.remaining == 0 && self.gain == 0.0
+    }
+}
+
+#[derive(Debug, Default)]
+struct AudioRuntime {
+    voices: BTreeMap<u32, Voice>,
+    pause: PauseEnvelope,
+}
+
+impl AudioRuntime {
+    fn handle_command(&mut self, command: GuestAudioCommand) -> Result<(), AudioRuntimeError> {
+        match command {
+            GuestAudioCommand::Play {
+                handle,
+                sequence,
+                repeat,
+            } => {
+                let prepared = PreparedSequence::from_guest(&sequence)?;
+                self.voices.insert(handle, Voice::new(prepared, repeat));
+            }
+            GuestAudioCommand::Stop { handle } => {
+                self.voices.remove(&handle);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn render_interleaved(&mut self, output: &mut [f32]) {
+        if !output.len().is_multiple_of(OUTPUT_CHANNELS as usize) {
+            output.fill(0.0);
+            return;
+        }
+
+        for samples in output.as_chunks_mut::<2>().0 {
+            let was_fully_paused = self.pause.is_fully_paused();
+            let gain = self.pause.next_gain();
+            let mut mixed = StereoFrame::SILENCE;
+
+            if !was_fully_paused {
+                for voice in self.voices.values_mut() {
+                    let frame = voice.render_frame();
+                    mixed.left += frame.left;
+                    mixed.right += frame.right;
+                }
+            }
+
+            self.voices.retain(|_, voice| !voice.finished);
+
+            samples[0] = (mixed.left * gain).clamp(-1.0, 1.0);
+            samples[1] = (mixed.right * gain).clamp(-1.0, 1.0);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RealtimeGuestAudioHost {
+    runtime: Arc<Mutex<AudioRuntime>>,
+}
+
+impl RealtimeGuestAudioHost {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_paused(&self, paused: bool) -> Result<(), AudioRuntimeError> {
+        self.runtime
+            .lock()
+            .map_err(|_| AudioRuntimeError::MutexPoisoned)?
+            .pause
+            .set_paused(paused);
+        Ok(())
+    }
+
+    pub fn render_for_test(&self, frame_count: usize) -> Result<Vec<StereoFrame>, AudioRuntimeError> {
+        let mut interleaved = vec![0.0_f32; frame_count.saturating_mul(2)];
+        self.runtime
+            .lock()
+            .map_err(|_| AudioRuntimeError::MutexPoisoned)?
+            .render_interleaved(&mut interleaved);
+
+        Ok(interleaved
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|frame| StereoFrame::new(frame[0], frame[1]))
+            .collect())
+    }
+
+    #[cfg(windows)]
+    fn runtime(&self) -> Arc<Mutex<AudioRuntime>> {
+        self.runtime.clone()
+    }
+}
+
+impl GuestAudioHost for RealtimeGuestAudioHost {
+    fn dispatch(&self, command: GuestAudioCommand) -> Result<(), GuestAudioHostError> {
+        self.runtime
+            .lock()
+            .map_err(|_| GuestAudioHostError::dispatch_failed("M32 realtime audio mutex poisoned"))?
+            .handle_command(command)
+            .map_err(|error| GuestAudioHostError::dispatch_failed(error.to_string()))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputDeviceInfo {
+    pub name: String,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub requested_buffer_frames: Option<u32>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum OutputStreamError {
+    NoDefaultDevice,
+    QueryConfigs(String),
+    NoCanonicalF32Stereo48kConfig,
+    BuildStream(String),
+    PlayStream(String),
+}
+
+#[cfg(windows)]
+impl fmt::Display for OutputStreamError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoDefaultDevice => write!(formatter, "no default Windows audio output device"),
+            Self::QueryConfigs(error) => {
+                write!(formatter, "failed to query output configs: {error}")
+            }
+            Self::NoCanonicalF32Stereo48kConfig => {
+                write!(formatter, "default device has no f32 stereo 48kHz output config")
+            }
+            Self::BuildStream(error) => {
+                write!(formatter, "failed to build audio stream: {error}")
+            }
+            Self::PlayStream(error) => {
+                write!(formatter, "failed to start audio stream: {error}")
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for OutputStreamError {}
+
+#[cfg(windows)]
+pub struct CpalOutputStream {
+    _stream: cpal::Stream,
+    info: OutputDeviceInfo,
+}
+
+#[cfg(windows)]
+impl CpalOutputStream {
+    pub fn open_default(host: &RealtimeGuestAudioHost) -> Result<Self, OutputStreamError> {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        use cpal::{BufferSize, SampleFormat, SupportedBufferSize};
+
+        let cpal_host = cpal::default_host();
+        let device = cpal_host
+            .default_output_device()
+            .ok_or(OutputStreamError::NoDefaultDevice)?;
+        let name = device
+            .description()
+            .map(|description| description.name().to_owned())
+            .unwrap_or_else(|_| "Unknown output device".to_owned());
+
+        let mut selected = None;
+        for range in device
+            .supported_output_configs()
+            .map_err(|error| OutputStreamError::QueryConfigs(error.to_string()))?
+        {
+            if range.channels() != u16::from(OUTPUT_CHANNELS)
+                || range.sample_format() != SampleFormat::F32
+                || range.min_sample_rate() > OUTPUT_SAMPLE_RATE_HZ
+                || range.max_sample_rate() < OUTPUT_SAMPLE_RATE_HZ
+            {
+                continue;
+            }
+
+            selected = Some(range.with_sample_rate(OUTPUT_SAMPLE_RATE_HZ));
+            break;
+        }
+
+        let supported = selected.ok_or(OutputStreamError::NoCanonicalF32Stereo48kConfig)?;
+
+        let requested_buffer_frames = match supported.buffer_size() {
+            SupportedBufferSize::Range { min, max }
+                if *min <= TARGET_LATENCY_FRAMES as u32 && TARGET_LATENCY_FRAMES as u32 <= *max =>
+            {
+                Some(TARGET_LATENCY_FRAMES as u32)
+            }
+            _ => None,
+        };
+
+        let mut config = supported.config();
+        config.buffer_size = requested_buffer_frames.map_or(BufferSize::Default, BufferSize::Fixed);
+
+        let runtime = host.runtime();
+        let stream = device
+            .build_output_stream(
+                config,
+                move |data: &mut [f32], _| {
+                    if let Ok(mut runtime) = runtime.try_lock() {
+                        runtime.render_interleaved(data);
+                    } else {
+                        data.fill(0.0);
+                    }
+                },
+                |error| eprintln!("M32 audio output stream error: {error}"),
+                None,
+            )
+            .map_err(|error| OutputStreamError::BuildStream(error.to_string()))?;
+
+        stream
+            .play()
+            .map_err(|error| OutputStreamError::PlayStream(error.to_string()))?;
+
+        Ok(Self {
+            _stream: stream,
+            info: OutputDeviceInfo {
+                name,
+                sample_rate_hz: config.sample_rate,
+                channels: config.channels,
+                requested_buffer_frames,
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn info(&self) -> &OutputDeviceInfo {
+        &self.info
+    }
+}
+
+#[cfg(test)]
+mod bundle_b_tests {
+    use m32_emulator_api::{GuestAudioEventData, GuestAudioSequence, GuestTimedAudioEvent};
+
+    use super::*;
+
+    fn wave_play(handle: u32, repeat: bool, time: u64, samples: Vec<i16>) -> GuestAudioCommand {
+        GuestAudioCommand::Play {
+            handle,
+            sequence: GuestAudioSequence {
+                duration: 0,
+                events: vec![GuestTimedAudioEvent {
+                    time,
+                    data: GuestAudioEventData::Wave {
+                        channels: 1,
+                        sampling_rate: OUTPUT_SAMPLE_RATE_HZ,
+                        samples,
+                    },
+                }],
+            },
+            repeat,
+        }
+    }
+
+    #[test]
+    fn realtime_host_schedules_wave_at_exact_millisecond_frame() {
+        let host = RealtimeGuestAudioHost::new();
+        host.dispatch(wave_play(1, false, 10, vec![16_384, 16_384]))
+            .expect("wave Play must be accepted");
+
+        let rendered = host.render_for_test(483).expect("render must succeed");
+        assert!(rendered[..480].iter().all(|frame| *frame == StereoFrame::SILENCE));
+        assert_eq!(rendered[480], StereoFrame::new(0.5, 0.5));
+        assert_eq!(rendered[481], StereoFrame::new(0.5, 0.5));
+        assert_eq!(rendered[482], StereoFrame::SILENCE);
+    }
+
+    #[test]
+    fn stop_by_handle_removes_active_voice_before_next_render() {
+        let host = RealtimeGuestAudioHost::new();
+        host.dispatch(wave_play(7, true, 0, vec![16_384, 16_384]))
+            .expect("repeating Play must be accepted");
+
+        assert_eq!(host.render_for_test(1).unwrap()[0], StereoFrame::new(0.5, 0.5));
+
+        host.dispatch(GuestAudioCommand::Stop { handle: 7 })
+            .expect("Stop must be accepted");
+
+        assert!(
+            host.render_for_test(8)
+                .unwrap()
+                .iter()
+                .all(|frame| *frame == StereoFrame::SILENCE)
+        );
+    }
+
+    #[test]
+    fn repeat_restarts_prepared_wave_deterministically() {
+        let host = RealtimeGuestAudioHost::new();
+        host.dispatch(wave_play(3, true, 0, vec![8_192, -8_192]))
+            .expect("repeat Play must be accepted");
+
+        let rendered = host.render_for_test(6).unwrap();
+        assert_eq!(rendered[0], StereoFrame::new(0.25, 0.25));
+        assert_eq!(rendered[1], StereoFrame::new(-0.25, -0.25));
+        assert_eq!(rendered[2], StereoFrame::new(0.25, 0.25));
+        assert_eq!(rendered[3], StereoFrame::new(-0.25, -0.25));
+    }
+
+    #[test]
+    fn baseline_midi_note_on_off_renders_signal_then_stops() {
+        let host = RealtimeGuestAudioHost::new();
+        host.dispatch(GuestAudioCommand::Play {
+            handle: 4,
+            sequence: GuestAudioSequence {
+                duration: 20,
+                events: vec![
+                    m32_emulator_api::GuestTimedAudioEvent {
+                        time: 0,
+                        data: GuestAudioEventData::Midi(vec![0x90, 69, 127]),
+                    },
+                    m32_emulator_api::GuestTimedAudioEvent {
+                        time: 10,
+                        data: GuestAudioEventData::Midi(vec![0x80, 69, 0]),
+                    },
+                ],
+            },
+            repeat: false,
+        })
+        .expect("MIDI Play must be accepted");
+
+        let rendered = host.render_for_test(960).unwrap();
+        assert!(rendered[1..480].iter().any(|frame| frame.left.abs() > 0.001));
+        assert!(rendered[480..].iter().all(|frame| frame.left.abs() < 0.000_001));
+    }
+
+    #[test]
+    fn pause_fade_reaches_zero_in_exact_3840_frames_and_freezes_voice() {
+        let host = RealtimeGuestAudioHost::new();
+        host.dispatch(wave_play(5, true, 0, vec![16_384]))
+            .expect("repeat Play must be accepted");
+        host.set_paused(true).expect("pause must be accepted");
+
+        let faded = host.render_for_test(PAUSE_FADE_FRAMES + 2).unwrap();
+
+        assert_eq!(faded[0], StereoFrame::new(0.5, 0.5));
+        assert!(faded[PAUSE_FADE_FRAMES - 1].left > 0.0);
+        assert_eq!(faded[PAUSE_FADE_FRAMES], StereoFrame::SILENCE);
+        assert_eq!(faded[PAUSE_FADE_FRAMES + 1], StereoFrame::SILENCE);
+
+        host.set_paused(false).expect("resume must be accepted");
+        let resumed = host.render_for_test(2).unwrap();
+        assert_eq!(resumed[0], StereoFrame::SILENCE);
+        assert!(resumed[1].left > 0.0);
     }
 }
 

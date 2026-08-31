@@ -2006,6 +2006,37 @@ mod tests {
         );
     }
 
+    fn audio_mmapi_platform_hosts(output: Arc<RecordingOutput>, audio: Arc<RecordingAudioHost>) -> WiePlatformHosts {
+        WiePlatformHosts {
+            display: Arc::new(RecordingDisplayHost::default()),
+            clock: Arc::new(DeterministicAdvancingClock::new(1_725_123_456_789, 1)),
+            database: Arc::new(RecordingDatabaseRepository::default()),
+            filesystem: Arc::new(RecordingFilesystemHost::default()),
+            audio,
+            output,
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        }
+    }
+
+    fn tick_until_stdout_contains_audio_sentinel(session: &mut WieSession, output: &RecordingOutput, sentinel: &[u8]) {
+        for _ in 0..AUDIO_MMAPI_MAX_TICKS {
+            session.tick().expect("MMAPI audio fixture must not fault");
+
+            let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+            if contains_bytes(&stdout, sentinel) {
+                return;
+            }
+        }
+
+        let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+        panic!(
+            "MMAPI audio sentinel not observed; sentinel={:?}; stdout={:?}",
+            String::from_utf8_lossy(sentinel),
+            String::from_utf8_lossy(&stdout),
+        );
+    }
+
     fn recording_platform_hosts_with_display_and_observers(
         display: Arc<dyn DisplayHost>,
         output: Arc<RecordingOutput>,
@@ -2264,6 +2295,29 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
     const INPUT_CANVAS_STUB_SOURCE: &str = include_str!("../test-fixtures/src/javax/microedition/lcdui/Canvas.java");
     const INPUT_KEY_READY_SENTINEL: &[u8] = b"M32_KEY_CANVAS_READY;";
     const INPUT_KEY_MAX_TICKS: usize = 512;
+    const AUDIO_MMAPI_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-audio-mmapi.jad");
+    const AUDIO_MMAPI_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-audio-mmapi.jar");
+    const AUDIO_MMAPI_SOURCE: &str = include_str!("../test-fixtures/src/m32/AudioMidlet.java");
+    const AUDIO_MMAPI_PLAY_SENTINEL: &[u8] = b"M32_AUDIO_PLAY_SENT;";
+    const AUDIO_MMAPI_STOP_SENTINEL: &[u8] = b"M32_AUDIO_STOP_SENT;";
+    const AUDIO_MMAPI_MAX_TICKS: usize = 512;
+
+    fn create_audio_mmapi_wie_session(hosts: WiePlatformHosts) -> Result<WieSession, EmulatorSessionCreateError> {
+        let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+        let emulator = wie_j2me::J2MEEmulator::from_jad_jar(
+            platform,
+            AUDIO_MMAPI_JAD.to_vec(),
+            "j2me-audio-mmapi.jar".to_owned(),
+            AUDIO_MMAPI_JAR.to_vec(),
+        )
+        .map_err(map_session_create_error)?;
+
+        Ok(WieSession {
+            emulator: Box::new(emulator),
+            state: SessionState::Ready,
+        })
+    }
 
     fn create_first_frame_paint_wie_session(hosts: WiePlatformHosts) -> Result<WieSession, EmulatorSessionCreateError> {
         let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
@@ -2597,6 +2651,57 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
 
         let stdout = output.stdout.lock().expect("stdout mutex poisoned");
         assert!(contains_bytes(&stdout, FIRST_FRAME_CANVAS_READY_SENTINEL));
+    }
+
+    #[test]
+    fn audio_mmapi_fixture_locks_guest_manager_player_contract() {
+        assert!(AUDIO_MMAPI_JAR.starts_with(b"PK\x03\x04"));
+        assert!(contains_bytes(AUDIO_MMAPI_JAD, b"MIDlet-1: M32 Audio,,m32.AudioMidlet"));
+        assert!(contains_bytes(AUDIO_MMAPI_JAR, b"m32/AudioMidlet.class"));
+        assert!(AUDIO_MMAPI_SOURCE.contains("Manager.createPlayer("));
+        assert!(AUDIO_MMAPI_SOURCE.contains("\"application/vnd.smaf\""));
+        assert!(AUDIO_MMAPI_SOURCE.contains("player.start();"));
+        assert!(AUDIO_MMAPI_SOURCE.contains("player.stop();"));
+        assert!(contains_bytes(AUDIO_MMAPI_JAR, b"M32_AUDIO_PLAY_SENT;"));
+        assert!(contains_bytes(AUDIO_MMAPI_JAR, b"M32_AUDIO_STOP_SENT;"));
+    }
+
+    #[test]
+    fn real_j2me_mmapi_start_stop_reaches_m32_audio_host() {
+        let output = Arc::new(RecordingOutput::default());
+        let audio = Arc::new(RecordingAudioHost::default());
+        let hosts = audio_mmapi_platform_hosts(output.clone(), audio.clone());
+
+        let mut session = create_audio_mmapi_wie_session(hosts).expect("MMAPI fixture must construct a Ready session");
+        assert_eq!(session.state(), SessionState::Ready);
+
+        tick_until_stdout_contains_audio_sentinel(&mut session, &output, AUDIO_MMAPI_STOP_SENTINEL);
+
+        assert_eq!(session.state(), SessionState::Running);
+
+        let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+        assert!(contains_bytes(&stdout, AUDIO_MMAPI_PLAY_SENTINEL));
+        assert!(contains_bytes(&stdout, AUDIO_MMAPI_STOP_SENTINEL));
+        drop(stdout);
+
+        let commands = audio.commands.lock().expect("audio commands mutex poisoned");
+        assert_eq!(commands.len(), 2);
+
+        match &commands[0] {
+            GuestAudioCommand::Play {
+                handle,
+                sequence,
+                repeat,
+            } => {
+                assert_eq!(*handle, 0);
+                assert_eq!(sequence.duration, 0);
+                assert!(sequence.events.is_empty());
+                assert!(!repeat);
+            }
+            other => panic!("expected guest MMAPI Play, got {other:?}"),
+        }
+
+        assert_eq!(commands[1], GuestAudioCommand::Stop { handle: 0 });
     }
 
     #[test]

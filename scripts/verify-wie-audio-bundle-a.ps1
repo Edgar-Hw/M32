@@ -56,21 +56,40 @@ try {
         throw "m32-audio missing from workspace metadata"
     }
 
-    $NormalDependencies = @(
+    $UnconditionalNormalDependencies = @(
         $AudioPackage.dependencies |
-            Where-Object { $null -eq $_.kind -or $_.kind -eq "normal" }
+            Where-Object {
+                ($null -eq $_.kind -or $_.kind -eq "normal") -and
+                $null -eq $_.target
+            }
     )
 
-    if ($NormalDependencies.Count -ne 1) {
-        throw "m32-audio must have exactly one normal dependency in Bundle A; found $($NormalDependencies.Count)"
+    if ($UnconditionalNormalDependencies.Count -ne 1) {
+        throw "m32-audio must have exactly one unconditional normal dependency; found $($UnconditionalNormalDependencies.Count)"
     }
 
-    if ($NormalDependencies[0].name -ne "m32-emulator-api") {
-        throw "m32-audio Bundle A dependency must be m32-emulator-api"
+    $ApiDependency = $UnconditionalNormalDependencies[0]
+
+    if ($ApiDependency.name -ne "m32-emulator-api") {
+        throw "m32-audio unconditional Bundle A dependency must be m32-emulator-api"
     }
 
-    if ($null -ne $NormalDependencies[0].source) {
+    if ($null -ne $ApiDependency.source) {
         throw "m32-audio -> m32-emulator-api must remain workspace-local/path-based"
+    }
+
+    $UnexpectedUnconditionalNormalDependencies = @(
+        $AudioPackage.dependencies |
+            Where-Object {
+                ($null -eq $_.kind -or $_.kind -eq "normal") -and
+                $null -eq $_.target -and
+                $_.name -ne "m32-emulator-api"
+            }
+    )
+
+    if ($UnexpectedUnconditionalNormalDependencies.Count -ne 0) {
+        $Names = ($UnexpectedUnconditionalNormalDependencies | ForEach-Object { $_.name }) -join ", "
+        throw "unexpected unconditional m32-audio production dependencies: $Names"
     }
 
     cargo test -p m32-audio
@@ -93,7 +112,7 @@ Write-Host "[PASS] T003 zero-rate failure boundary"
 Write-Host "[PASS] T004 deterministic stereo summing/saturation/silence"
 Write-Host "[PASS] T005 thread-safe GuestAudioHost FIFO ingress"
 Write-Host "[PASS] T005 Play/Stop/MIDI/Wave payload preservation"
-Write-Host "[PASS] m32-audio has exactly one workspace-local production dependency"
+Write-Host "[PASS] m32-audio core has exactly one unconditional workspace-local production dependency"
 Write-Host "[PASS] previous 0.0.4 Input version-close chain"
 Write-Host "M32 0.0.5 Audio Bundle A verification passed."
 exit 0

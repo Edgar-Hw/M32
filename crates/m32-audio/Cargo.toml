@@ -9,3 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 m32-emulator-api = { path = "../m32-emulator-api" }
+
+[target.'cfg(windows)'.dependencies]
+cpal = "=0.18.2"
