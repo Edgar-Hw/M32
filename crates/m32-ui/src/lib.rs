@@ -1,12 +1,11 @@
 //! M32 First Playable shell UI.
 //!
-//! Bundle A implements only the locked boot ritual and the Play-screen
-//! composition skeleton. Real guest frame, input and audio integration remain
-//! later First Playable tasks.
+//! The shell stays backend-agnostic. The desktop composition layer supplies an
+//! optional egui texture representing the latest M32 RGBA8 guest frame.
 
 use std::time::{Duration, Instant};
 
-use egui::{Align, Align2, Color32, Context, FontId, Frame, Layout, RichText, Sense, Stroke, Vec2};
+use egui::{Align, Align2, Color32, Context, FontId, Frame, Layout, Rect, RichText, Sense, Stroke, TextureId, Vec2};
 
 pub const BOOT_DURATION_MS: u64 = 1_000;
 
@@ -58,10 +57,6 @@ impl CheckState {
     }
 }
 
-/// Truthful status values displayed by the boot ritual.
-///
-/// Bundle A deliberately reports Sound and Game Card as waiting because their
-/// live desktop composition is not connected until later 0.1.0 tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootStatus {
     pub memory: CheckState,
@@ -71,14 +66,31 @@ pub struct BootStatus {
 }
 
 impl BootStatus {
-    pub const fn bundle_a_ready() -> Self {
+    pub const fn first_playable(has_local_game: bool) -> Self {
         Self {
             memory: CheckState::Ready,
             gpu: CheckState::Ready,
+            // CPAL keep-alive is T005, so Bundle A must not claim audible output.
             sound: CheckState::Waiting,
-            game_card: CheckState::Waiting,
+            game_card: if has_local_game {
+                CheckState::Ready
+            } else {
+                CheckState::Waiting
+            },
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GameViewport {
+    pub texture_id: TextureId,
+    pub source_size: Vec2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeDeckStatus {
+    pub game_loaded: bool,
+    pub input_live: bool,
 }
 
 pub struct FirstPlayableShell {
@@ -116,12 +128,12 @@ impl FirstPlayableShell {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    pub fn show(&mut self, ui: &mut egui::Ui, viewport: Option<GameViewport>, runtime: RuntimeDeckStatus) {
         self.advance(Instant::now());
 
         match self.screen {
             AppScreen::Boot => self.show_boot(ui),
-            AppScreen::Play => self.show_play(ui),
+            AppScreen::Play => self.show_play(ui, viewport, runtime),
         }
     }
 
@@ -150,7 +162,7 @@ impl FirstPlayableShell {
             });
     }
 
-    fn show_play(&self, ui: &mut egui::Ui) {
+    fn show_play(&self, ui: &mut egui::Ui, viewport: Option<GameViewport>, runtime: RuntimeDeckStatus) {
         egui::CentralPanel::default()
             .frame(Frame::default().fill(BG0).inner_margin(24.0))
             .show(ui, |ui| {
@@ -177,13 +189,22 @@ impl FirstPlayableShell {
                         Stroke::new(1.0, Color32::from_rgb(0x2A, 0x32, 0x3A)),
                         egui::StrokeKind::Inside,
                     );
-                    ui.painter().text(
-                        viewport_rect.center(),
-                        Align2::CENTER_CENTER,
-                        "GAME VIEWPORT\nWaiting for local JAD/JAR",
-                        FontId::proportional(18.0),
-                        MUTED,
-                    );
+
+                    if let Some(viewport) = viewport {
+                        paint_pixel_perfect(ui, viewport_rect, viewport);
+                    } else {
+                        ui.painter().text(
+                            viewport_rect.center(),
+                            Align2::CENTER_CENTER,
+                            if runtime.game_loaded {
+                                "GAME VIEWPORT\nWaiting for first guest frame"
+                            } else {
+                                "GAME VIEWPORT\nRun with --jad <file.jad> --jar <file.jar>"
+                            },
+                            FontId::proportional(18.0),
+                            MUTED,
+                        );
+                    }
 
                     ui.add_space(gap);
 
@@ -198,17 +219,17 @@ impl FirstPlayableShell {
                                 ui.label(RichText::new("SYSTEM DECK").size(12.0).strong().color(PLASTIC));
                                 ui.add_space(16.0);
 
-                                deck_row(ui, "DISPLAY", "GPU READY");
-                                deck_row(ui, "INPUT", "NEXT BUNDLE");
-                                deck_row(ui, "AUDIO", "NEXT BUNDLE");
-                                deck_row(ui, "STORAGE", "CORE READY");
+                                deck_row(ui, "DISPLAY", if viewport.is_some() { "LIVE" } else { "READY" });
+                                deck_row(ui, "INPUT", if runtime.input_live { "LIVE" } else { "WAITING" });
+                                deck_row(ui, "AUDIO", "HOST READY");
+                                deck_row(ui, "STORAGE", "WIRED");
 
                                 ui.add_space(20.0);
                                 ui.separator();
                                 ui.add_space(12.0);
-                                ui.label(RichText::new("Bundle A").size(13.0).strong().color(TEXT));
+                                ui.label(RichText::new("0.1.0 Bundle A").size(13.0).strong().color(TEXT));
                                 ui.label(
-                                    RichText::new("Native shell + GPU + Boot + Play skeleton")
+                                    RichText::new("Local JAD/JAR + live frame + keyboard input")
                                         .size(12.0)
                                         .color(MUTED),
                                 );
@@ -227,6 +248,26 @@ pub fn apply_theme(context: &Context) {
     visuals.faint_bg_color = SURFACE2;
     visuals.override_text_color = Some(TEXT);
     context.set_visuals(visuals);
+}
+
+fn paint_pixel_perfect(ui: &egui::Ui, bounds: Rect, viewport: GameViewport) {
+    if viewport.source_size.x <= 0.0 || viewport.source_size.y <= 0.0 {
+        return;
+    }
+
+    let scale = (bounds.width() / viewport.source_size.x)
+        .min(bounds.height() / viewport.source_size.y)
+        .floor()
+        .max(1.0);
+    let size = viewport.source_size * scale;
+    let rect = Rect::from_center_size(bounds.center(), size);
+
+    ui.painter().image(
+        viewport.texture_id,
+        rect,
+        Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 fn boot_check(ui: &mut egui::Ui, name: &str, state: CheckState) {
@@ -266,18 +307,18 @@ mod tests {
     }
 
     #[test]
-    fn bundle_a_boot_status_is_truthful_about_unconnected_services() {
-        let status = BootStatus::bundle_a_ready();
+    fn first_playable_boot_status_does_not_claim_cpal_before_t005() {
+        let status = BootStatus::first_playable(true);
         assert_eq!(status.memory, CheckState::Ready);
         assert_eq!(status.gpu, CheckState::Ready);
         assert_eq!(status.sound, CheckState::Waiting);
-        assert_eq!(status.game_card, CheckState::Waiting);
+        assert_eq!(status.game_card, CheckState::Ready);
     }
 
     #[test]
     fn boot_transitions_only_after_locked_duration() {
         let start = Instant::now();
-        let mut shell = FirstPlayableShell::new_at(start, BootStatus::bundle_a_ready());
+        let mut shell = FirstPlayableShell::new_at(start, BootStatus::first_playable(false));
 
         shell.advance(start + Duration::from_millis(999));
         assert_eq!(shell.screen(), AppScreen::Boot);

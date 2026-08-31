@@ -1,3 +1,4 @@
+mod composition;
 mod crash;
 mod desktop;
 mod logging;
@@ -12,6 +13,7 @@ fn main() {
         eprintln!("M32 logging initialization failed: {error}");
         std::process::exit(1);
     }
+
     let paths = match paths::AppPaths::discover() {
         Ok(paths) => paths,
         Err(error) => {
@@ -24,6 +26,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+
     if let Err(error) = paths.ensure_directories() {
         tracing::error!(
             target: "m32::storage",
@@ -34,7 +37,16 @@ fn main() {
         std::process::exit(2);
     }
 
+    let launch = match composition::LocalLaunchRequest::from_args(std::env::args_os()) {
+        Ok(launch) => launch,
+        Err(error) => {
+            eprintln!("M32 local launch arguments are invalid: {error}");
+            std::process::exit(2);
+        }
+    };
+
     let info = BuildInfo::current();
+
     tracing::info!(
         target: "m32::lifecycle",
         event = "app_start",
@@ -48,6 +60,7 @@ fn main() {
         build_profile = info.build_profile,
         "M32 application started"
     );
+
     tracing::debug!(
         target: "m32::storage",
         event = "runtime_paths_ready",
@@ -56,7 +69,7 @@ fn main() {
 
     crash::trigger_smoke_test_if_requested();
 
-    if let Err(error) = desktop::run() {
+    if let Err(error) = desktop::run(paths.root.clone(), launch) {
         tracing::error!(
             target: "m32::lifecycle",
             event = "desktop_runtime_failed",

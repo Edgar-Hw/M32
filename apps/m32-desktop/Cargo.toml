@@ -11,9 +11,14 @@ path = "src/main.rs"
 [dependencies]
 egui.workspace = true
 egui-winit.workspace = true
+m32-audio = { path = "../../crates/m32-audio" }
 m32-display = { path = "../../crates/m32-display" }
 m32-domain = { path = "../../crates/m32-domain" }
+m32-emulator-api = { path = "../../crates/m32-emulator-api" }
+m32-input = { path = "../../crates/m32-input" }
+m32-storage = { path = "../../crates/m32-storage" }
 m32-ui = { path = "../../crates/m32-ui" }
+m32-wie-adapter = { path = "../../crates/m32-wie-adapter" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true

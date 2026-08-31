@@ -528,6 +528,13 @@ pub trait EmulatorSession {
     fn backend(&self) -> BackendDescriptor;
     fn state(&self) -> SessionState;
     fn handle_input(&mut self, event: GuestInputEvent);
+
+    /// Forward a host display redraw request into the active backend.
+    ///
+    /// The default is a no-op so non-graphical/synthetic backends remain
+    /// source-compatible. Concrete graphical adapters override this hook.
+    fn handle_redraw(&mut self) {}
+
     fn tick(&mut self) -> Result<(), EmulatorSessionError>;
 }
 

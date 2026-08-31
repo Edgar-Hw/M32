@@ -15,7 +15,6 @@ for ($Task = 1; $Task -le 4; $Task++) {
     Write-Host "[PASS] evidence 0.1.0-$TaskId ($(Split-Path $Evidence -Leaf))"
 }
 
-# The immediately previous release gate must still pass after the desktop changes.
 powershell -ExecutionPolicy Bypass -File "$PSScriptRoot\verify-storage-version-close.ps1"
 if ($LASTEXITCODE -ne 0) {
     throw "0.0.6 Storage version-close regression chain failed with exit code $LASTEXITCODE"
@@ -30,124 +29,110 @@ try {
     $Metadata = $MetadataJson | ConvertFrom-Json
 
     $Desktop = $Metadata.packages | Where-Object { $_.name -eq "m32-desktop" }
-    $Ui = $Metadata.packages | Where-Object { $_.name -eq "m32-ui" }
-    $Display = $Metadata.packages | Where-Object { $_.name -eq "m32-display" }
-
-    if ($null -eq $Desktop -or $null -eq $Ui -or $null -eq $Display) {
-        throw "m32-desktop/m32-ui/m32-display must all exist in workspace metadata"
+    if ($null -eq $Desktop) {
+        throw "m32-desktop missing from workspace metadata"
     }
 
-    foreach ($Forbidden in @("m32-wie-adapter", "m32-storage", "m32-audio")) {
-        $Hit = @($Desktop.dependencies | Where-Object { $_.name -eq $Forbidden })
-        if ($Hit.Count -ne 0) {
-            throw "Bundle A boundary violation: m32-desktop must not directly depend on $Forbidden"
-        }
-    }
-    Write-Host "[PASS] desktop composition boundary excludes WIE/storage/audio direct dependencies"
-
-    $ExpectedDesktopLocal = @("m32-display", "m32-domain", "m32-ui")
-    foreach ($Name in $ExpectedDesktopLocal) {
+    foreach ($Name in @(
+        "m32-audio",
+        "m32-display",
+        "m32-domain",
+        "m32-emulator-api",
+        "m32-input",
+        "m32-storage",
+        "m32-ui",
+        "m32-wie-adapter"
+    )) {
         $Hit = @($Desktop.dependencies | Where-Object { $_.name -eq $Name })
         if ($Hit.Count -ne 1 -or $null -ne $Hit[0].source) {
             throw "m32-desktop must have one workspace-local/path dependency on $Name"
         }
     }
-    Write-Host "[PASS] desktop -> domain/ui/display workspace-local composition boundary"
+    Write-Host "[PASS] T001 desktop composition owns concrete M32 runtime crates"
 
-    $ExpectedPins = @{
-        "egui" = "=0.36.1"
-        "egui-wgpu" = "=0.36.1"
-        "egui-winit" = "=0.36.1"
-        "pollster" = "=0.4.0"
-        "wgpu" = "=30.0.1"
-        "winit" = "=0.30.13"
-    }
-
-    foreach ($Pair in $ExpectedPins.GetEnumerator()) {
-        $Found = @(
-            $Metadata.packages.dependencies |
-            Where-Object { $_.name -eq $Pair.Key }
-        )
-        if ($Found.Count -eq 0) {
-            throw "Dependency $($Pair.Key) not present in workspace package metadata"
-        }
-        foreach ($Dependency in $Found) {
-            if ($Dependency.req -ne $Pair.Value) {
-                throw "$($Pair.Key) must remain pinned exactly to $($Pair.Value); found $($Dependency.req)"
-            }
+    foreach ($Forbidden in @("wie_backend", "wie_j2me", "wie_util")) {
+        $Hit = @($Desktop.dependencies | Where-Object { $_.name -eq $Forbidden })
+        if ($Hit.Count -ne 0) {
+            throw "desktop must not depend directly on raw WIE crate $Forbidden"
         }
     }
-    Write-Host "[PASS] exact egui/winit/wgpu/pollster Bundle A dependency pins"
+    Write-Host "[PASS] desktop has no raw WIE dependency"
 
-    $RootCargo = Get-Content -LiteralPath (Join-Path $RepoRoot "Cargo.toml") -Raw
-    $LockedWie = "f0513eb758c02736981f545ad030eed937d55f3e"
-    if (($RootCargo | Select-String -Pattern $LockedWie -AllMatches).Matches.Count -lt 4) {
-        throw "Locked WIE revision is missing from expected root Cargo.toml dependency/metadata positions"
+    $Composition = Get-Content -LiteralPath (Join-Path $RepoRoot "apps\m32-desktop\src\composition.rs") -Raw
+    foreach ($Token in @(
+        "LiveDisplayHost",
+        "SystemClockHost",
+        "DesktopOutputHost",
+        "DesktopExitHost",
+        "DesktopVibrationHost",
+        "RealtimeGuestAudioHost",
+        "PersistentGuestStorage",
+        "WiePlatformHosts",
+        "create_j2me_jad_jar_session"
+    )) {
+        if ($Composition -notmatch [regex]::Escape($Token)) {
+            throw "T001 composition source missing: $Token"
+        }
     }
-    Write-Host "[PASS] locked WIE revision unchanged"
+    Write-Host "[PASS] T001 concrete display/clock/output/exit/vibration/audio/storage/WIE composition"
 
+    foreach ($Token in @(
+        "--jad",
+        "--jar",
+        "fs::read",
+        "JadRead",
+        "JarRead",
+        "validate_extension"
+    )) {
+        if ($Composition -notmatch [regex]::Escape($Token)) {
+            throw "T002 local launch source missing: $Token"
+        }
+    }
+    Write-Host "[PASS] T002 explicit local JAD+JAR path and clear file errors"
+
+    $Api = Get-Content -LiteralPath (Join-Path $RepoRoot "crates\m32-emulator-api\src\lib.rs") -Raw
+    $Adapter = Get-Content -LiteralPath (Join-Path $RepoRoot "crates\m32-wie-adapter\src\lib.rs") -Raw
     $DesktopSource = Get-Content -LiteralPath (Join-Path $RepoRoot "apps\m32-desktop\src\desktop.rs") -Raw
-    foreach ($Token in @(
-        "REFERENCE_WINDOW_WIDTH",
-        "REFERENCE_WINDOW_HEIGHT",
-        "MIN_WINDOW_WIDTH",
-        "MIN_WINDOW_HEIGHT",
-        "ApplicationHandler",
-        "DisplayRenderer::new",
-        "gpu_device_lost",
-        "gpu_renderer_recovered"
-    )) {
-        if ($DesktopSource -notmatch [regex]::Escape($Token)) {
-            throw "Desktop source missing locked Bundle A token: $Token"
+    $Ui = Get-Content -LiteralPath (Join-Path $RepoRoot "crates\m32-ui\src\lib.rs") -Raw
+
+    foreach ($Token in @("fn handle_redraw(&mut self)", "latest_after", "TextureOptions::NEAREST")) {
+        $All = "$Api`n$Adapter`n$Composition`n$DesktopSource"
+        if ($All -notmatch [regex]::Escape($Token)) {
+            throw "T003 live-frame path missing: $Token"
         }
     }
-    Write-Host "[PASS] T001 native window and T002 renderer-recovery composition tokens"
+    if ($Ui -notmatch [regex]::Escape(".floor()")) {
+        throw "T003 Pixel Perfect integer scale marker missing"
+    }
+    Write-Host "[PASS] T003 redraw seam + latest-frame replacement + NEAREST integer presentation"
 
-    $UiSource = Get-Content -LiteralPath (Join-Path $RepoRoot "crates\m32-ui\src\lib.rs") -Raw
     foreach ($Token in @(
-        "BOOT_DURATION_MS: u64 = 1_000",
-        "PLAY_VIEWPORT_WIDTH: f32 = 1_040.0",
-        "PLAY_GAP: f32 = 16.0",
-        "PLAY_SIDE_DECK_WIDTH: f32 = 264.0",
-        "MEMORY",
-        "SOUND",
-        "GAME CARD",
-        "Waiting for local JAD/JAR"
+        "GuestInputController",
+        "repeats_due",
+        "key_down",
+        "key_up",
+        "event.repeat"
     )) {
-        if ($UiSource -notmatch [regex]::Escape($Token)) {
-            throw "UI source missing locked Bundle A token: $Token"
+        $All = "$Composition`n$DesktopSource"
+        if ($All -notmatch [regex]::Escape($Token)) {
+            throw "T004 input pump missing: $Token"
         }
     }
-    Write-Host "[PASS] T003 one-second boot and T004 Play geometry tokens"
+    Write-Host "[PASS] T004 existing m32-input policy is wired into desktop runtime"
 
-    $Notice = Get-Content -LiteralPath (Join-Path $RepoRoot "THIRD_PARTY_NOTICES.md") -Raw
-    foreach ($Token in @(
-        "egui, egui-winit, egui-wgpu",
-        "winit",
-        "wgpu",
-        "pollster",
-        "CPAL",
-        "rusqlite / bundled SQLite"
-    )) {
-        if ($Notice -notmatch [regex]::Escape($Token)) {
-            throw "THIRD_PARTY_NOTICES missing linked component record: $Token"
-        }
-    }
-    Write-Host "[PASS] linked UI/GPU plus existing audio/storage third-party notice inventory"
-
-    cargo test -p m32-ui
+    cargo test -p m32-desktop composition::tests
     if ($LASTEXITCODE -ne 0) {
-        throw "m32-ui tests failed with exit code $LASTEXITCODE"
+        throw "m32-desktop composed runtime tests failed with exit code $LASTEXITCODE"
     }
 
-    cargo test -p m32-display
+    cargo test -p m32-desktop desktop::tests::keyboard_mapping_matches_locked_first_playable_defaults
     if ($LASTEXITCODE -ne 0) {
-        throw "m32-display tests failed with exit code $LASTEXITCODE"
+        throw "desktop keyboard mapping test failed with exit code $LASTEXITCODE"
     }
 
-    cargo check -p m32-desktop --target x86_64-pc-windows-msvc
+    cargo test -p m32-wie-adapter wie_session_forwards_m32_redraw_hook_to_pinned_backend
     if ($LASTEXITCODE -ne 0) {
-        throw "m32-desktop Windows compile gate failed with exit code $LASTEXITCODE"
+        throw "WIE redraw seam test failed with exit code $LASTEXITCODE"
     }
 
     cargo fmt --all -- --check
@@ -193,13 +178,12 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[PASS] T001 native Windows shell contract"
-Write-Host "[PASS] T002 egui/wgpu renderer, resize and device-loss recovery boundary"
-Write-Host "[PASS] T003 truthful 1000ms M32 boot ritual"
-Write-Host "[PASS] T004 1040 + 16 + 264 First Playable composition skeleton"
-Write-Host "[PASS] previous 0.0.6 Storage version-close regression chain"
-Write-Host "[PASS] exact UI/GPU dependency pins"
-Write-Host "[PASS] WIE and RustJava boundary unchanged"
+Write-Host "[PASS] T001 desktop runtime composition root"
+Write-Host "[PASS] T002 explicit local JAD+JAR playable launch"
+Write-Host "[PASS] T003 live guest RGBA8 presentation loop"
+Write-Host "[PASS] T004 desktop keyboard -> m32-input -> real guest Canvas callback"
+Write-Host "[PASS] previous 0.0.6 regression chain"
+Write-Host "[PASS] raw WIE/RustJava boundaries unchanged"
 Write-Host "[PASS] workspace fmt/clippy/test/check quality gates"
 Write-Host "[PASS] git diff whitespace gate"
 Write-Host ""

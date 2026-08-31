@@ -605,6 +605,10 @@ impl EmulatorSession for WieSession {
         self.emulator.handle_event(map_m32_input_event(event));
     }
 
+    fn handle_redraw(&mut self) {
+        self.emulator.handle_event(wie_backend::Event::Redraw);
+    }
+
     fn tick(&mut self) -> Result<(), EmulatorSessionError> {
         match catch_unwind(AssertUnwindSafe(|| self.emulator.tick())) {
             Ok(Ok(())) => {
@@ -3327,6 +3331,39 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
             }
             _ => panic!("KeyRepeat must map to pinned WIE Keyrepeat"),
         }
+    }
+
+    struct RecordingRedrawEmulator {
+        redraws: Arc<AtomicU64>,
+    }
+
+    impl wie_backend::Emulator for RecordingRedrawEmulator {
+        fn handle_event(&mut self, event: wie_backend::Event) {
+            if matches!(event, wie_backend::Event::Redraw) {
+                self.redraws.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn tick(&mut self) -> wie_util::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wie_session_forwards_m32_redraw_hook_to_pinned_backend() {
+        let redraws = Arc::new(AtomicU64::new(0));
+        let mut session = WieSession {
+            emulator: Box::new(RecordingRedrawEmulator {
+                redraws: redraws.clone(),
+            }),
+            state: SessionState::Ready,
+        };
+
+        session.handle_redraw();
+        session.handle_redraw();
+
+        assert_eq!(redraws.load(Ordering::Relaxed), 2);
+        assert_eq!(session.state(), SessionState::Ready);
     }
 
     #[test]
