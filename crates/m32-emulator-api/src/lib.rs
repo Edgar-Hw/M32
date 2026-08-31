@@ -396,6 +396,70 @@ pub trait EmulatorBackend: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum M32Key {
+    Up,
+    Down,
+    Left,
+    Right,
+    Ok,
+    LeftSoft,
+    RightSoft,
+    Clear,
+    Call,
+    Hangup,
+    VolumeUp,
+    VolumeDown,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
+    Hash,
+    Star,
+}
+
+impl M32Key {
+    pub const ALL: [Self; 24] = [
+        Self::Up,
+        Self::Down,
+        Self::Left,
+        Self::Right,
+        Self::Ok,
+        Self::LeftSoft,
+        Self::RightSoft,
+        Self::Clear,
+        Self::Call,
+        Self::Hangup,
+        Self::VolumeUp,
+        Self::VolumeDown,
+        Self::Num0,
+        Self::Num1,
+        Self::Num2,
+        Self::Num3,
+        Self::Num4,
+        Self::Num5,
+        Self::Num6,
+        Self::Num7,
+        Self::Num8,
+        Self::Num9,
+        Self::Hash,
+        Self::Star,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuestInputEvent {
+    KeyDown(M32Key),
+    KeyUp(M32Key),
+    KeyRepeat(M32Key),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionCreateErrorCode {
     BackendLaunchFailed,
 }
@@ -463,6 +527,7 @@ impl Error for EmulatorSessionError {}
 pub trait EmulatorSession {
     fn backend(&self) -> BackendDescriptor;
     fn state(&self) -> SessionState;
+    fn handle_input(&mut self, event: GuestInputEvent);
     fn tick(&mut self) -> Result<(), EmulatorSessionError>;
 }
 
@@ -486,6 +551,7 @@ mod tests {
 
     struct SyntheticSession {
         state: SessionState,
+        input: Vec<GuestInputEvent>,
     }
 
     impl EmulatorSession for SyntheticSession {
@@ -495,6 +561,10 @@ mod tests {
 
         fn state(&self) -> SessionState {
             self.state
+        }
+
+        fn handle_input(&mut self, event: GuestInputEvent) {
+            self.input.push(event);
         }
 
         fn tick(&mut self) -> Result<(), EmulatorSessionError> {
@@ -1070,6 +1140,61 @@ mod tests {
     }
 
     #[test]
+    fn m32_key_contract_covers_complete_pinned_feature_phone_surface() {
+        use std::collections::HashSet;
+
+        assert_eq!(M32Key::ALL.len(), 24);
+        assert_eq!(M32Key::ALL.into_iter().collect::<HashSet<_>>().len(), M32Key::ALL.len());
+
+        assert!(M32Key::ALL.contains(&M32Key::Up));
+        assert!(M32Key::ALL.contains(&M32Key::Ok));
+        assert!(M32Key::ALL.contains(&M32Key::LeftSoft));
+        assert!(M32Key::ALL.contains(&M32Key::RightSoft));
+        assert!(M32Key::ALL.contains(&M32Key::Num0));
+        assert!(M32Key::ALL.contains(&M32Key::Num9));
+        assert!(M32Key::ALL.contains(&M32Key::Hash));
+        assert!(M32Key::ALL.contains(&M32Key::Star));
+    }
+
+    #[test]
+    fn guest_input_event_preserves_key_and_phase() {
+        assert_eq!(
+            GuestInputEvent::KeyDown(M32Key::Left),
+            GuestInputEvent::KeyDown(M32Key::Left)
+        );
+        assert_ne!(
+            GuestInputEvent::KeyDown(M32Key::Left),
+            GuestInputEvent::KeyUp(M32Key::Left)
+        );
+        assert_ne!(
+            GuestInputEvent::KeyUp(M32Key::Left),
+            GuestInputEvent::KeyRepeat(M32Key::Left)
+        );
+    }
+
+    #[test]
+    fn session_trait_accepts_backend_agnostic_input_events() {
+        let mut session = SyntheticSession {
+            state: SessionState::Ready,
+            input: Vec::new(),
+        };
+
+        session.handle_input(GuestInputEvent::KeyDown(M32Key::Num5));
+        session.handle_input(GuestInputEvent::KeyRepeat(M32Key::Num5));
+        session.handle_input(GuestInputEvent::KeyUp(M32Key::Num5));
+
+        assert_eq!(
+            session.input,
+            vec![
+                GuestInputEvent::KeyDown(M32Key::Num5),
+                GuestInputEvent::KeyRepeat(M32Key::Num5),
+                GuestInputEvent::KeyUp(M32Key::Num5),
+            ]
+        );
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    #[test]
     fn session_create_error_keeps_stable_code_and_message() {
         let error =
             EmulatorSessionCreateError::new(SessionCreateErrorCode::BackendLaunchFailed, "synthetic launch failure");
@@ -1106,6 +1231,7 @@ mod tests {
     fn session_trait_is_implementation_agnostic() {
         let mut session = SyntheticSession {
             state: SessionState::Ready,
+            input: Vec::new(),
         };
 
         assert_eq!(session.state(), SessionState::Ready);

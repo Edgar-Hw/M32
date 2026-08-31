@@ -13,8 +13,8 @@ use m32_emulator_api::{
     BackendDescriptor, ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorBackend, EmulatorSession,
     EmulatorSessionCreateError, EmulatorSessionError, ExitHost, GuestAudioCommand, GuestAudioEventData, GuestAudioHost,
     GuestAudioHostError, GuestAudioSequence, GuestDatabaseError, GuestDatabaseHost, GuestDatabaseRepositoryHost,
-    GuestFilesystemError, GuestFilesystemHost, GuestOutputHost, GuestTimedAudioEvent, HostServiceKind, RgbaFrame,
-    SessionCreateErrorCode, SessionErrorCode, SessionState, VibrationHost,
+    GuestFilesystemError, GuestFilesystemHost, GuestInputEvent, GuestOutputHost, GuestTimedAudioEvent, HostServiceKind,
+    M32Key, RgbaFrame, SessionCreateErrorCode, SessionErrorCode, SessionState, VibrationHost,
 };
 use wie_util::WieError;
 
@@ -601,6 +601,10 @@ impl EmulatorSession for WieSession {
         self.state
     }
 
+    fn handle_input(&mut self, event: GuestInputEvent) {
+        self.emulator.handle_event(map_m32_input_event(event));
+    }
+
     fn tick(&mut self) -> Result<(), EmulatorSessionError> {
         match catch_unwind(AssertUnwindSafe(|| self.emulator.tick())) {
             Ok(Ok(())) => {
@@ -621,6 +625,43 @@ impl EmulatorSession for WieSession {
                 Err(map_tick_panic())
             }
         }
+    }
+}
+
+fn map_m32_key(key: M32Key) -> wie_backend::KeyCode {
+    match key {
+        M32Key::Up => wie_backend::KeyCode::UP,
+        M32Key::Down => wie_backend::KeyCode::DOWN,
+        M32Key::Left => wie_backend::KeyCode::LEFT,
+        M32Key::Right => wie_backend::KeyCode::RIGHT,
+        M32Key::Ok => wie_backend::KeyCode::OK,
+        M32Key::LeftSoft => wie_backend::KeyCode::LEFT_SOFT_KEY,
+        M32Key::RightSoft => wie_backend::KeyCode::RIGHT_SOFT_KEY,
+        M32Key::Clear => wie_backend::KeyCode::CLEAR,
+        M32Key::Call => wie_backend::KeyCode::CALL,
+        M32Key::Hangup => wie_backend::KeyCode::HANGUP,
+        M32Key::VolumeUp => wie_backend::KeyCode::VOLUME_UP,
+        M32Key::VolumeDown => wie_backend::KeyCode::VOLUME_DOWN,
+        M32Key::Num0 => wie_backend::KeyCode::NUM0,
+        M32Key::Num1 => wie_backend::KeyCode::NUM1,
+        M32Key::Num2 => wie_backend::KeyCode::NUM2,
+        M32Key::Num3 => wie_backend::KeyCode::NUM3,
+        M32Key::Num4 => wie_backend::KeyCode::NUM4,
+        M32Key::Num5 => wie_backend::KeyCode::NUM5,
+        M32Key::Num6 => wie_backend::KeyCode::NUM6,
+        M32Key::Num7 => wie_backend::KeyCode::NUM7,
+        M32Key::Num8 => wie_backend::KeyCode::NUM8,
+        M32Key::Num9 => wie_backend::KeyCode::NUM9,
+        M32Key::Hash => wie_backend::KeyCode::HASH,
+        M32Key::Star => wie_backend::KeyCode::STAR,
+    }
+}
+
+fn map_m32_input_event(event: GuestInputEvent) -> wie_backend::Event {
+    match event {
+        GuestInputEvent::KeyDown(key) => wie_backend::Event::Keydown(map_m32_key(key)),
+        GuestInputEvent::KeyUp(key) => wie_backend::Event::Keyup(map_m32_key(key)),
+        GuestInputEvent::KeyRepeat(key) => wie_backend::Event::Keyrepeat(map_m32_key(key)),
     }
 }
 
@@ -668,6 +709,36 @@ mod tests {
     use super::*;
     use m32_emulator_api::DisplayHostErrorCode;
     use wie_backend::{Screen, canvas::Color};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RecordedInputPhase {
+        Down,
+        Up,
+        Repeat,
+    }
+
+    struct RecordingInputEmulator {
+        events: Arc<Mutex<Vec<(RecordedInputPhase, wie_backend::KeyCode)>>>,
+    }
+
+    impl wie_backend::Emulator for RecordingInputEmulator {
+        fn handle_event(&mut self, event: wie_backend::Event) {
+            let mapped = match event {
+                wie_backend::Event::Keydown(key) => Some((RecordedInputPhase::Down, key)),
+                wie_backend::Event::Keyup(key) => Some((RecordedInputPhase::Up, key)),
+                wie_backend::Event::Keyrepeat(key) => Some((RecordedInputPhase::Repeat, key)),
+                _ => None,
+            };
+
+            if let Some(mapped) = mapped {
+                self.events.lock().expect("input event mutex poisoned").push(mapped);
+            }
+        }
+
+        fn tick(&mut self) -> wie_util::Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Default)]
     struct RecordingDisplayHost {
@@ -2644,6 +2715,86 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
         panic!(
             "synthetic missing-main JAR did not reach the expected fault boundary within {CORE_SMOKE_MAX_TICKS} ticks"
         );
+    }
+
+    #[test]
+    fn m32_key_maps_exactly_to_pinned_wie_key_code() {
+        let cases = [
+            (M32Key::Up, wie_backend::KeyCode::UP),
+            (M32Key::Down, wie_backend::KeyCode::DOWN),
+            (M32Key::Left, wie_backend::KeyCode::LEFT),
+            (M32Key::Right, wie_backend::KeyCode::RIGHT),
+            (M32Key::Ok, wie_backend::KeyCode::OK),
+            (M32Key::LeftSoft, wie_backend::KeyCode::LEFT_SOFT_KEY),
+            (M32Key::RightSoft, wie_backend::KeyCode::RIGHT_SOFT_KEY),
+            (M32Key::Clear, wie_backend::KeyCode::CLEAR),
+            (M32Key::Call, wie_backend::KeyCode::CALL),
+            (M32Key::Hangup, wie_backend::KeyCode::HANGUP),
+            (M32Key::VolumeUp, wie_backend::KeyCode::VOLUME_UP),
+            (M32Key::VolumeDown, wie_backend::KeyCode::VOLUME_DOWN),
+            (M32Key::Num0, wie_backend::KeyCode::NUM0),
+            (M32Key::Num1, wie_backend::KeyCode::NUM1),
+            (M32Key::Num2, wie_backend::KeyCode::NUM2),
+            (M32Key::Num3, wie_backend::KeyCode::NUM3),
+            (M32Key::Num4, wie_backend::KeyCode::NUM4),
+            (M32Key::Num5, wie_backend::KeyCode::NUM5),
+            (M32Key::Num6, wie_backend::KeyCode::NUM6),
+            (M32Key::Num7, wie_backend::KeyCode::NUM7),
+            (M32Key::Num8, wie_backend::KeyCode::NUM8),
+            (M32Key::Num9, wie_backend::KeyCode::NUM9),
+            (M32Key::Hash, wie_backend::KeyCode::HASH),
+            (M32Key::Star, wie_backend::KeyCode::STAR),
+        ];
+
+        assert_eq!(cases.len(), M32Key::ALL.len());
+        for (m32_key, wie_key) in cases {
+            assert_eq!(map_m32_key(m32_key), wie_key);
+        }
+    }
+
+    #[test]
+    fn m32_input_event_maps_press_release_repeat_to_wie_event() {
+        match map_m32_input_event(GuestInputEvent::KeyDown(M32Key::Ok)) {
+            wie_backend::Event::Keydown(key) => assert_eq!(key, wie_backend::KeyCode::OK),
+            _ => panic!("KeyDown must map to pinned WIE Keydown"),
+        }
+
+        match map_m32_input_event(GuestInputEvent::KeyUp(M32Key::LeftSoft)) {
+            wie_backend::Event::Keyup(key) => {
+                assert_eq!(key, wie_backend::KeyCode::LEFT_SOFT_KEY);
+            }
+            _ => panic!("KeyUp must map to pinned WIE Keyup"),
+        }
+
+        match map_m32_input_event(GuestInputEvent::KeyRepeat(M32Key::Num7)) {
+            wie_backend::Event::Keyrepeat(key) => {
+                assert_eq!(key, wie_backend::KeyCode::NUM7);
+            }
+            _ => panic!("KeyRepeat must map to pinned WIE Keyrepeat"),
+        }
+    }
+
+    #[test]
+    fn wie_session_forwards_m32_input_events_to_pinned_backend() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut session = WieSession {
+            emulator: Box::new(RecordingInputEmulator { events: events.clone() }),
+            state: SessionState::Ready,
+        };
+
+        session.handle_input(GuestInputEvent::KeyDown(M32Key::Right));
+        session.handle_input(GuestInputEvent::KeyRepeat(M32Key::Right));
+        session.handle_input(GuestInputEvent::KeyUp(M32Key::Right));
+
+        assert_eq!(
+            *events.lock().expect("input event mutex poisoned"),
+            vec![
+                (RecordedInputPhase::Down, wie_backend::KeyCode::RIGHT),
+                (RecordedInputPhase::Repeat, wie_backend::KeyCode::RIGHT),
+                (RecordedInputPhase::Up, wie_backend::KeyCode::RIGHT),
+            ]
+        );
+        assert_eq!(session.state(), SessionState::Ready);
     }
 
     #[test]
