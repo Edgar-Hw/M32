@@ -4,11 +4,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(windows)]
+use m32_audio::CpalOutputStream;
 use m32_audio::RealtimeGuestAudioHost;
 use m32_emulator_api::{
     ClockHost, DisplayHost, DisplayHostError, DisplaySize, EmulatorSession, EmulatorSessionError, ExitHost,
@@ -93,6 +95,7 @@ pub enum PlayableLaunchError {
     JarRead { path: PathBuf, source: std::io::Error },
     JarFilename(PathBuf),
     Storage(String),
+    AudioOutput(String),
     Session(String),
 }
 
@@ -105,6 +108,7 @@ impl fmt::Display for PlayableLaunchError {
             Self::JarRead { path, source } => write!(formatter, "cannot read local JAR '{}': {source}", path.display()),
             Self::JarFilename(path) => write!(formatter, "local JAR has no usable filename: {}", path.display()),
             Self::Storage(message) => write!(formatter, "open M32 persistent guest storage: {message}"),
+            Self::AudioOutput(message) => write!(formatter, "open Windows realtime audio output: {message}"),
             Self::Session(message) => write!(formatter, "create WIE JAD+JAR session: {message}"),
         }
     }
@@ -285,6 +289,35 @@ impl VibrationHost for DesktopVibrationHost {
     }
 }
 
+struct RealtimeAudioBridge {
+    host: Arc<RealtimeGuestAudioHost>,
+    dispatched_commands: AtomicU64,
+}
+
+impl RealtimeAudioBridge {
+    fn new(host: Arc<RealtimeGuestAudioHost>) -> Self {
+        Self {
+            host,
+            dispatched_commands: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn dispatched_commands(&self) -> u64 {
+        self.dispatched_commands.load(Ordering::Acquire)
+    }
+}
+
+impl GuestAudioHost for RealtimeAudioBridge {
+    fn dispatch(
+        &self,
+        command: m32_emulator_api::GuestAudioCommand,
+    ) -> Result<(), m32_emulator_api::GuestAudioHostError> {
+        self.dispatched_commands.fetch_add(1, Ordering::AcqRel);
+        self.host.dispatch(command)
+    }
+}
+
 pub struct PlayableRuntime {
     session: Box<dyn EmulatorSession>,
     display: Arc<LiveDisplayHost>,
@@ -293,11 +326,27 @@ pub struct PlayableRuntime {
     input: GuestInputController,
     started_at: Instant,
     _audio: Arc<RealtimeGuestAudioHost>,
+    _audio_bridge: Arc<RealtimeAudioBridge>,
+    #[cfg(windows)]
+    _audio_stream: Option<CpalOutputStream>,
     _storage: PersistentGuestStorage,
 }
 
 impl PlayableRuntime {
     pub fn launch_local(m32_root: &Path, request: &LocalLaunchRequest) -> Result<Self, PlayableLaunchError> {
+        Self::launch_local_with_audio_output(m32_root, request, true)
+    }
+
+    #[cfg(test)]
+    fn launch_local_for_test(m32_root: &Path, request: &LocalLaunchRequest) -> Result<Self, PlayableLaunchError> {
+        Self::launch_local_with_audio_output(m32_root, request, false)
+    }
+
+    fn launch_local_with_audio_output(
+        m32_root: &Path,
+        request: &LocalLaunchRequest,
+        open_physical_audio: bool,
+    ) -> Result<Self, PlayableLaunchError> {
         validate_extension(&request.jad_path, "jad")
             .map_err(|()| PlayableLaunchError::JadExtension(request.jad_path.clone()))?;
         validate_extension(&request.jar_path, "jar")
@@ -325,10 +374,32 @@ impl PlayableRuntime {
         let output = Arc::new(DesktopOutputHost::default());
         let exit = Arc::new(DesktopExitHost::default());
         let audio = Arc::new(RealtimeGuestAudioHost::new());
+        let audio_bridge = Arc::new(RealtimeAudioBridge::new(audio.clone()));
+
+        #[cfg(windows)]
+        let audio_stream = if open_physical_audio {
+            let stream = CpalOutputStream::open_default(audio.as_ref())
+                .map_err(|error| PlayableLaunchError::AudioOutput(error.to_string()))?;
+            tracing::info!(
+                target: "m32::audio",
+                event = "realtime_audio_output_ready",
+                device = %stream.info().name,
+                sample_rate_hz = stream.info().sample_rate_hz,
+                channels = stream.info().channels,
+                requested_buffer_frames = ?stream.info().requested_buffer_frames,
+                "M32 realtime Windows audio output is active"
+            );
+            Some(stream)
+        } else {
+            None
+        };
+
+        #[cfg(not(windows))]
+        let _ = open_physical_audio;
 
         let database: Arc<dyn GuestDatabaseRepositoryHost> = Arc::new(storage.database_repository());
         let filesystem: Arc<dyn GuestFilesystemHost> = Arc::new(storage.filesystem());
-        let audio_host: Arc<dyn GuestAudioHost> = audio.clone();
+        let audio_host: Arc<dyn GuestAudioHost> = audio_bridge.clone();
 
         let hosts = WiePlatformHosts {
             display: display.clone(),
@@ -352,6 +423,9 @@ impl PlayableRuntime {
             input: GuestInputController::new(),
             started_at: Instant::now(),
             _audio: audio,
+            _audio_bridge: audio_bridge,
+            #[cfg(windows)]
+            _audio_stream: audio_stream,
             _storage: storage,
         })
     }
@@ -403,6 +477,21 @@ impl PlayableRuntime {
     }
 
     #[cfg(test)]
+    fn state(&self) -> m32_emulator_api::SessionState {
+        self.session.state()
+    }
+
+    #[cfg(test)]
+    fn audio_dispatch_count(&self) -> u64 {
+        self._audio_bridge.dispatched_commands()
+    }
+
+    #[cfg(test)]
+    fn storage_paths(&self) -> &m32_storage::StoragePaths {
+        self._storage.paths()
+    }
+
+    #[cfg(test)]
     fn output(&self) -> &Arc<DesktopOutputHost> {
         &self._output
     }
@@ -434,6 +523,10 @@ mod tests {
         include_bytes!("../../../crates/m32-wie-adapter/test-fixtures/j2me-input-key-observer.jar");
     const PAINT_JAD: &[u8] = include_bytes!("../../../crates/m32-wie-adapter/test-fixtures/j2me-first-frame-paint.jad");
     const PAINT_JAR: &[u8] = include_bytes!("../../../crates/m32-wie-adapter/test-fixtures/j2me-first-frame-paint.jar");
+    const RMS_JAD: &[u8] = include_bytes!("../../../crates/m32-wie-adapter/test-fixtures/j2me-rms-persistence.jad");
+    const RMS_JAR: &[u8] = include_bytes!("../../../crates/m32-wie-adapter/test-fixtures/j2me-rms-persistence.jar");
+    const FIRST_PLAYABLE_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-first-playable.jad");
+    const FIRST_PLAYABLE_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-first-playable.jar");
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -486,7 +579,7 @@ mod tests {
         let jar_path = root.path().join("game.jar");
         fs::write(&jar_path, PAINT_JAR).unwrap();
 
-        let error = match PlayableRuntime::launch_local(
+        let error = match PlayableRuntime::launch_local_for_test(
             root.path(),
             &LocalLaunchRequest {
                 jad_path: root.path().join("missing.jad"),
@@ -524,7 +617,7 @@ mod tests {
     fn composed_local_fixture_reaches_real_guest_frame() {
         let root = TestRoot::new("frame");
         let request = root.fixture("paint", PAINT_JAD, PAINT_JAR);
-        let mut runtime = PlayableRuntime::launch_local(root.path(), &request).expect("fixture launch");
+        let mut runtime = PlayableRuntime::launch_local_for_test(root.path(), &request).expect("fixture launch");
 
         let revision = 0;
         for _ in 0..512 {
@@ -544,13 +637,69 @@ mod tests {
     fn composed_input_pump_reaches_real_canvas_key_pressed_callback() {
         let root = TestRoot::new("input");
         let request = root.fixture("input", INPUT_JAD, INPUT_JAR);
-        let mut runtime = PlayableRuntime::launch_local(root.path(), &request).expect("fixture launch");
+        let mut runtime = PlayableRuntime::launch_local_for_test(root.path(), &request).expect("fixture launch");
 
         pump_until_stdout(&mut runtime, b"M32_KEY_CANVAS_READY;");
         assert_eq!(runtime.key_down(M32Key::Up), KeyDownOutcome::Accepted);
         pump_until_stdout(&mut runtime, b"M32_KEY_PRESSED:141;");
         runtime.key_up(M32Key::Up);
         pump_until_stdout(&mut runtime, b"M32_KEY_RELEASED:141;");
+    }
+
+    #[test]
+    fn composed_storage_uses_real_m32_root_and_survives_runtime_rebuild() {
+        let root = TestRoot::new("storage-wire");
+        let request = root.fixture("rms", RMS_JAD, RMS_JAR);
+
+        {
+            let mut runtime =
+                PlayableRuntime::launch_local_for_test(root.path(), &request).expect("first RMS composed launch");
+            assert_eq!(runtime.storage_paths().root, root.path());
+            pump_until_stdout(&mut runtime, b"M32_RMS_SAVED;");
+        }
+
+        {
+            let mut runtime =
+                PlayableRuntime::launch_local_for_test(root.path(), &request).expect("second RMS composed launch");
+            pump_until_stdout(&mut runtime, b"M32_RMS_LOADED_OK;");
+        }
+    }
+
+    #[test]
+    fn first_playable_fixture_integrates_frame_input_audio_and_rms() {
+        let root = TestRoot::new("integrated");
+        let request = root.fixture("first-playable", FIRST_PLAYABLE_JAD, FIRST_PLAYABLE_JAR);
+        let mut runtime =
+            PlayableRuntime::launch_local_for_test(root.path(), &request).expect("First Playable fixture launch");
+
+        pump_until_stdout(&mut runtime, b"M32_FP_RUNNING:0;");
+        assert_eq!(runtime.state(), m32_emulator_api::SessionState::Running);
+
+        let first = pump_until_frame_after(&mut runtime, 0);
+        assert_eq!(first.frame.size, DisplaySize::new(176, 220));
+
+        let audio_before = runtime.audio_dispatch_count();
+        assert_eq!(runtime.key_down(M32Key::Right), KeyDownOutcome::Accepted);
+        pump_until_stdout(&mut runtime, b"M32_FP_INPUT:1;");
+        pump_until_stdout(&mut runtime, b"M32_FP_AUDIO:1;");
+        runtime.key_up(M32Key::Right);
+
+        let second = pump_until_frame_after(&mut runtime, first.revision);
+        assert_ne!(first.frame.pixels, second.frame.pixels);
+        assert!(runtime.audio_dispatch_count() > audio_before);
+
+        pump_until_stdout(&mut runtime, b"M32_FP_SAVED:1;");
+    }
+
+    fn pump_until_frame_after(runtime: &mut PlayableRuntime, revision: u64) -> LiveFrameSnapshot {
+        for _ in 0..512 {
+            runtime.pump().expect("fixture pump");
+            if let Some(snapshot) = runtime.latest_frame_after(revision) {
+                return snapshot;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("guest frame revision after {revision} not observed");
     }
 
     fn pump_until_stdout(runtime: &mut PlayableRuntime, sentinel: &[u8]) {

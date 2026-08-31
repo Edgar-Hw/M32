@@ -1,0 +1,6 @@
+MIDlet-Name: M32 First Playable
+MIDlet-Version: 1.0.0
+MIDlet-Vendor: M32
+MIDlet-1: M32 First Playable,,m32.FirstPlayableMidlet
+MicroEdition-Profile: MIDP-2.0
+MicroEdition-Configuration: CLDC-1.1
