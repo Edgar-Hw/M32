@@ -325,6 +325,8 @@ pub struct PlayableRuntime {
     exit: Arc<DesktopExitHost>,
     input: GuestInputController,
     started_at: Instant,
+    paused: bool,
+    pause_started_at: Option<Instant>,
     _audio: Arc<RealtimeGuestAudioHost>,
     _audio_bridge: Arc<RealtimeAudioBridge>,
     #[cfg(windows)]
@@ -422,6 +424,8 @@ impl PlayableRuntime {
             exit,
             input: GuestInputController::new(),
             started_at: Instant::now(),
+            paused: false,
+            pause_started_at: None,
             _audio: audio,
             _audio_bridge: audio_bridge,
             #[cfg(windows)]
@@ -431,6 +435,10 @@ impl PlayableRuntime {
     }
 
     pub fn pump(&mut self) -> Result<(), EmulatorSessionError> {
+        if self.paused {
+            return Ok(());
+        }
+
         let now_ms = self.elapsed_ms();
         for event in self.input.repeats_due(now_ms) {
             self.session.handle_input(event);
@@ -456,6 +464,35 @@ impl PlayableRuntime {
         if let Some(event) = self.input.key_up(key) {
             self.session.handle_input(event);
         }
+    }
+
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), m32_audio::AudioRuntimeError> {
+        if self.paused == paused {
+            return Ok(());
+        }
+
+        self._audio.set_paused(paused)?;
+        if paused {
+            self.pause_started_at = Some(Instant::now());
+        } else if let Some(pause_started_at) = self.pause_started_at.take() {
+            let paused_for = pause_started_at.elapsed();
+            if let Some(adjusted_started_at) = self.started_at.checked_add(paused_for) {
+                self.started_at = adjusted_started_at;
+            }
+        }
+        self.paused = paused;
+        tracing::info!(
+            target: "m32::lifecycle",
+            event = if paused { "playable_paused" } else { "playable_resumed" },
+            "M32 playable runtime pause state changed"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     pub fn latest_frame_after(&self, revision: u64) -> Option<LiveFrameSnapshot> {
@@ -497,6 +534,17 @@ impl PlayableRuntime {
     }
 }
 
+impl Drop for PlayableRuntime {
+    fn drop(&mut self) {
+        let _ = self._audio.set_paused(true);
+        tracing::info!(
+            target: "m32::lifecycle",
+            event = "playable_runtime_drop",
+            "M32 playable runtime is releasing session, audio stream, and persistent storage handles"
+        );
+    }
+}
+
 fn validate_extension(path: &Path, expected: &str) -> Result<(), ()> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some(extension) if extension.eq_ignore_ascii_case(expected) => Ok(()),
@@ -527,6 +575,9 @@ mod tests {
     const RMS_JAR: &[u8] = include_bytes!("../../../crates/m32-wie-adapter/test-fixtures/j2me-rms-persistence.jar");
     const FIRST_PLAYABLE_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-first-playable.jad");
     const FIRST_PLAYABLE_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-first-playable.jar");
+    const FAULT_JAD: &[u8] = b"MIDlet-Name: M32 Fault Fixture\nMIDlet-Version: 1.0.0\nMIDlet-Vendor: M32\nMIDlet-1: M32 Fault Fixture,,m32.DoesNotExist\nMicroEdition-Profile: MIDP-2.0\nMicroEdition-Configuration: CLDC-1.1\n";
+    const FAULT_JAR: &[u8] =
+        include_bytes!("../../../crates/m32-wie-adapter/test-fixtures/j2me-core-smoke-missing-main.jar");
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -689,6 +740,91 @@ mod tests {
         assert!(runtime.audio_dispatch_count() > audio_before);
 
         pump_until_stdout(&mut runtime, b"M32_FP_SAVED:1;");
+    }
+
+    #[test]
+    fn first_playable_restart_restores_visible_saved_value_through_full_composition() {
+        let root = TestRoot::new("restart-visible");
+        let request = root.fixture("first-playable", FIRST_PLAYABLE_JAD, FIRST_PLAYABLE_JAR);
+
+        let saved_pixels = {
+            let mut runtime =
+                PlayableRuntime::launch_local_for_test(root.path(), &request).expect("first First Playable launch");
+            pump_until_stdout(&mut runtime, b"M32_FP_RUNNING:0;");
+            let first = pump_until_frame_after(&mut runtime, 0);
+
+            assert_eq!(runtime.key_down(M32Key::Right), KeyDownOutcome::Accepted);
+            pump_until_stdout(&mut runtime, b"M32_FP_SAVED:1;");
+            runtime.key_up(M32Key::Right);
+
+            let saved = pump_until_frame_after(&mut runtime, first.revision);
+            assert_ne!(first.frame.pixels, saved.frame.pixels);
+            saved.frame.pixels
+        };
+
+        let mut rebuilt =
+            PlayableRuntime::launch_local_for_test(root.path(), &request).expect("rebuilt First Playable launch");
+        pump_until_stdout(&mut rebuilt, b"M32_FP_RUNNING:1;");
+        let restored = pump_until_frame_after(&mut rebuilt, 0);
+        assert_eq!(restored.frame.pixels, saved_pixels);
+    }
+
+    #[test]
+    fn playable_pause_resume_stops_pump_without_destroying_runtime() {
+        let root = TestRoot::new("pause-resume");
+        let request = root.fixture("first-playable", FIRST_PLAYABLE_JAD, FIRST_PLAYABLE_JAR);
+        let mut runtime = PlayableRuntime::launch_local_for_test(root.path(), &request).expect("First Playable launch");
+
+        pump_until_stdout(&mut runtime, b"M32_FP_RUNNING:0;");
+        let frame = pump_until_frame_after(&mut runtime, 0);
+
+        runtime.set_paused(true).expect("pause must succeed");
+        assert!(runtime.is_paused());
+        for _ in 0..16 {
+            runtime.pump().expect("paused pump must stay non-faulting");
+        }
+        assert!(runtime.latest_frame_after(frame.revision).is_none());
+
+        runtime.set_paused(false).expect("resume must succeed");
+        assert!(!runtime.is_paused());
+        runtime.pump().expect("resumed runtime must tick");
+    }
+
+    #[test]
+    fn product_exit_request_reaches_runtime_without_panic() {
+        let root = TestRoot::new("product-exit");
+        let request = root.fixture("first-playable", FIRST_PLAYABLE_JAD, FIRST_PLAYABLE_JAR);
+        let mut runtime = PlayableRuntime::launch_local_for_test(root.path(), &request).expect("First Playable launch");
+
+        pump_until_stdout(&mut runtime, b"M32_FP_RUNNING:0;");
+        assert!(!runtime.exit_requested());
+
+        runtime.exit.request_exit();
+
+        assert!(runtime.exit_requested());
+        assert_eq!(runtime.state(), m32_emulator_api::SessionState::Running);
+    }
+
+    #[test]
+    fn backend_fault_remains_an_error_at_product_boundary() {
+        let root = TestRoot::new("backend-fault");
+        let request = root.fixture("fault", FAULT_JAD, FAULT_JAR);
+        let mut runtime = PlayableRuntime::launch_local_for_test(root.path(), &request)
+            .expect("fault fixture should construct a product runtime");
+
+        for _ in 0..512 {
+            match runtime.pump() {
+                Ok(()) => thread::sleep(Duration::from_millis(1)),
+                Err(error) => {
+                    assert_eq!(error.code, m32_emulator_api::SessionErrorCode::BackendTickFailed);
+                    assert_eq!(runtime.state(), m32_emulator_api::SessionState::Faulted);
+                    assert!(!runtime.exit_requested());
+                    return;
+                }
+            }
+        }
+
+        panic!("fault fixture did not reach the backend fault boundary");
     }
 
     fn pump_until_frame_after(runtime: &mut PlayableRuntime, revision: u64) -> LiveFrameSnapshot {

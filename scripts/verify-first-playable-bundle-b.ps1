@@ -78,12 +78,14 @@ try {
     if ($JadHash -ne "a30f6dacf6b5eb8ebc0cbabc0e9008d60a0c38918ac6960b88b57f182a76e0d2") {
         throw "T007 JAD hash drift: $JadHash"
     }
-    if ($JarHash -ne "faabd43fab74fa715fea50573fdd13713c0d83c696c72c72673d975a319b84c6") {
+    if ($JarHash -ne "b8eb1efefb3e54783492d72f3255d33b7ad66d7527d1305e08e1e0e49731b6b5") {
         throw "T007 JAR hash drift: $JarHash"
     }
     foreach ($Token in @(
         "RecordStore.openRecordStore",
         "Manager.createPlayer",
+        "0x4D, 0x4D, 0x4D, 0x44",
+        "(byte) 0x90",
         "repaint()",
         "M32_FP_RUNNING:",
         "M32_FP_INPUT:",

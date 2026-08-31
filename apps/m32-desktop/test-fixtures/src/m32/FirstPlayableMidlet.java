@@ -55,8 +55,24 @@ public final class FirstPlayableMidlet extends MIDlet {
 
     void emitAudio(int counter) {
         try {
+            byte[] tone = new byte[] {
+                0x4D, 0x4D, 0x4D, 0x44,
+                0x00, 0x00, 0x00, 0x2F,
+                0x4D, 0x54, 0x52, 0x30,
+                0x00, 0x00, 0x00, 0x25,
+                0x02, 0x00, 0x10, 0x10,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x4D, 0x74, 0x73, 0x71,
+                0x00, 0x00, 0x00, 0x09,
+                0x00, (byte) 0x90, 0x3C, 0x64, 0x14,
+                0x1E, (byte) 0xFF, 0x2F, 0x00,
+                0x00, 0x00
+            };
             Player player = Manager.createPlayer(
-                new ByteArrayInputStream(new byte[0]),
+                new ByteArrayInputStream(tone),
                 "application/vnd.smaf"
             );
             player.start();
@@ -64,7 +80,6 @@ public final class FirstPlayableMidlet extends MIDlet {
             System.out.print(counter);
             System.out.print(";");
             System.out.flush();
-            player.stop();
         } catch (Exception error) {
             System.out.print("M32_FP_AUDIO_FAILURE;");
             System.out.flush();

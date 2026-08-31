@@ -4,4 +4,5 @@ public abstract class MIDlet {
     protected abstract void startApp();
     protected void pauseApp() {}
     protected void destroyApp(boolean unconditional) {}
+    public final void notifyDestroyed() {}
 }

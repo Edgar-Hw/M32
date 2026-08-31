@@ -200,6 +200,7 @@ impl DesktopRuntime {
                 return;
             }
             if playable.exit_requested() {
+                self.stop_playable("backend_exit");
                 event_loop.exit();
                 return;
             }
@@ -300,7 +301,37 @@ impl DesktopRuntime {
         }
     }
 
+    fn set_playable_paused(&mut self, event_loop: &ActiveEventLoop, paused: bool) {
+        let result = self.playable.as_mut().map(|playable| playable.set_paused(paused));
+
+        if let Some(Err(error)) = result {
+            self.fail(event_loop, format!("change playable pause state to {paused}: {error}"));
+        }
+    }
+
+    fn stop_playable(&mut self, reason: &'static str) {
+        if let Some(mut playable) = self.playable.take() {
+            if let Err(error) = playable.set_paused(true) {
+                tracing::warn!(
+                    target: "m32::audio",
+                    event = "playable_stop_pause_failed",
+                    reason,
+                    error = %error,
+                    "M32 playable runtime stop could not finish pause fade request"
+                );
+            }
+            drop(playable);
+            tracing::info!(
+                target: "m32::lifecycle",
+                event = "playable_runtime_stopped",
+                reason,
+                "M32 playable runtime stopped and concrete service handles were released"
+            );
+        }
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: String) {
+        self.stop_playable("fault");
         tracing::error!(
             target: "m32::lifecycle",
             event = "native_desktop_failed",
@@ -342,7 +373,13 @@ impl ApplicationHandler for DesktopRuntime {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.stop_playable("window_close");
+                event_loop.exit();
+            }
+            WindowEvent::Focused(focused) => {
+                self.set_playable_paused(event_loop, !focused);
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
