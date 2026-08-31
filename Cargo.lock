@@ -592,6 +592,9 @@ version = "0.0.0"
 [[package]]
 name = "m32-input"
 version = "0.0.0"
+dependencies = [
+ "m32-emulator-api",
+]
 
 [[package]]
 name = "m32-library"
