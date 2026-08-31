@@ -802,6 +802,30 @@ mod tests {
         }
     }
 
+    struct DeterministicAdvancingClock {
+        next_epoch_millis: Mutex<u64>,
+        step_millis: u64,
+    }
+
+    impl DeterministicAdvancingClock {
+        fn new(start_epoch_millis: u64, step_millis: u64) -> Self {
+            assert!(step_millis > 0, "advancing clock step must be positive");
+            Self {
+                next_epoch_millis: Mutex::new(start_epoch_millis),
+                step_millis,
+            }
+        }
+    }
+
+    impl ClockHost for DeterministicAdvancingClock {
+        fn epoch_millis(&self) -> u64 {
+            let mut next = self.next_epoch_millis.lock().expect("advancing clock mutex poisoned");
+            let now = *next;
+            *next = next.saturating_add(self.step_millis);
+            now
+        }
+    }
+
     #[derive(Default)]
     struct RecordingOutput {
         stdout: Mutex<Vec<u8>>,
@@ -1948,6 +1972,15 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_advancing_clock_moves_forward_for_sleeping_tasks() {
+        let clock = DeterministicAdvancingClock::new(1_725_123_456_789, 1);
+
+        assert_eq!(clock.epoch_millis(), 1_725_123_456_789);
+        assert_eq!(clock.epoch_millis(), 1_725_123_456_790);
+        assert_eq!(clock.epoch_millis(), 1_725_123_456_791);
+    }
+
+    #[test]
     fn pinned_j2me_emulator_implements_wie_emulator_contract() {
         fn assert_emulator<T: wie_backend::Emulator>() {}
 
@@ -2150,6 +2183,106 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
     const FIRST_FRAME_PAINT_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-first-frame-paint.jar");
     const FIRST_FRAME_PAINT_CANVAS_SOURCE: &str = include_str!("../test-fixtures/src/m32/PaintCanvas.java");
     const FIRST_FRAME_PAINT_MIDLET_SOURCE: &str = include_str!("../test-fixtures/src/m32/PaintMidlet.java");
+    const FIRST_FRAME_CANVAS_READY_SENTINEL: &[u8] = b"M32_FIRST_FRAME_CANVAS_READY";
+    const FIRST_FRAME_CAPTURE_MAX_TICKS: usize = 512;
+
+    fn create_first_frame_paint_wie_session(hosts: WiePlatformHosts) -> Result<WieSession, EmulatorSessionCreateError> {
+        let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+        let emulator = wie_j2me::J2MEEmulator::from_jad_jar(
+            platform,
+            FIRST_FRAME_PAINT_JAD.to_vec(),
+            "j2me-first-frame-paint.jar".to_owned(),
+            FIRST_FRAME_PAINT_JAR.to_vec(),
+        )
+        .map_err(map_session_create_error)?;
+
+        Ok(WieSession {
+            emulator: Box::new(emulator),
+            state: SessionState::Ready,
+        })
+    }
+
+    fn tick_until_first_captured_frame(
+        session: &mut WieSession,
+        display: &FirstFrameCaptureDisplayHost,
+        max_ticks: usize,
+    ) -> RgbaFrame {
+        let mut forwarded_redraws = 0_u32;
+
+        for _ in 0..max_ticks {
+            session.tick().expect("paint fixture must not fault before first frame");
+
+            let requested_redraws = display.redraw_count();
+            while forwarded_redraws < requested_redraws {
+                session.emulator.handle_event(wie_backend::Event::Redraw);
+                forwarded_redraws += 1;
+            }
+
+            if let Some(frame) = display.first_frame() {
+                return frame;
+            }
+        }
+
+        panic!(
+            "first guest-generated frame was not captured within {max_ticks} ticks; redraws={}, presents={}",
+            display.redraw_count(),
+            display.present_count(),
+        );
+    }
+
+    fn write_first_frame_preview_bmp(path: &std::path::Path, frame: &RgbaFrame) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        const WIDTH: usize = 176;
+        const HEIGHT: usize = 220;
+        const BYTES_PER_PIXEL: usize = 4;
+        const HEADER_LEN: usize = 14 + 40;
+
+        let expected_len = WIDTH * HEIGHT * BYTES_PER_PIXEL;
+        assert_eq!(
+            frame.pixels.len(),
+            expected_len,
+            "preview exporter expects the T006 176x220 RGBA8 fixture"
+        );
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let image_len = expected_len;
+        let file_len = HEADER_LEN + image_len;
+        let mut file = std::fs::File::create(path)?;
+
+        // BITMAPFILEHEADER
+        file.write_all(b"BM")?;
+        file.write_all(&(file_len as u32).to_le_bytes())?;
+        file.write_all(&[0_u8; 4])?;
+        file.write_all(&(HEADER_LEN as u32).to_le_bytes())?;
+
+        // BITMAPINFOHEADER
+        file.write_all(&40_u32.to_le_bytes())?;
+        file.write_all(&(WIDTH as i32).to_le_bytes())?;
+        // Negative height keeps the RGBA framebuffer's top-to-bottom row order.
+        file.write_all(&(-(HEIGHT as i32)).to_le_bytes())?;
+        file.write_all(&1_u16.to_le_bytes())?;
+        file.write_all(&32_u16.to_le_bytes())?;
+        file.write_all(&0_u32.to_le_bytes())?;
+        file.write_all(&(image_len as u32).to_le_bytes())?;
+        file.write_all(&0_i32.to_le_bytes())?;
+        file.write_all(&0_i32.to_le_bytes())?;
+        file.write_all(&0_u32.to_le_bytes())?;
+        file.write_all(&0_u32.to_le_bytes())?;
+
+        // Windows BMP stores 32-bit pixels as BGRA.
+        let (rgba_pixels, remainder) = frame.pixels.as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for rgba in rgba_pixels {
+            file.write_all(&[rgba[2], rgba[1], rgba[0], rgba[3]])?;
+        }
+
+        file.flush()
+    }
 
     #[test]
     fn first_frame_paint_fixture_locks_canvas_and_pixel_pattern_contract() {
@@ -2184,6 +2317,51 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
 
         assert_eq!(session.backend(), wie_backend_descriptor());
         assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    #[test]
+    fn first_frame_paint_fixture_ticks_until_guest_frame_is_captured() {
+        let display = Arc::new(FirstFrameCaptureDisplayHost::default());
+        display
+            .resize(DisplaySize::new(176, 220))
+            .expect("first-frame logical screen size must be accepted");
+
+        let output = Arc::new(RecordingOutput::default());
+        let filesystem = Arc::new(RecordingFilesystemHost::default());
+        let hosts = WiePlatformHosts {
+            display: display.clone(),
+            clock: Arc::new(DeterministicAdvancingClock::new(1_725_123_456_789, 1)),
+            database: Arc::new(RecordingDatabaseRepository::default()),
+            filesystem,
+            audio: Arc::new(RecordingAudioHost::default()),
+            output: output.clone(),
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        };
+
+        let mut session = create_first_frame_paint_wie_session(hosts)
+            .expect("paint fixture must construct a concrete Ready WIE session");
+
+        assert_eq!(session.state(), SessionState::Ready);
+        assert_eq!(display.present_count(), 0);
+        assert_eq!(display.first_frame(), None);
+
+        let frame = tick_until_first_captured_frame(&mut session, &display, FIRST_FRAME_CAPTURE_MAX_TICKS);
+
+        assert_eq!(session.state(), SessionState::Running);
+        assert!(display.redraw_count() >= 1);
+        assert!(display.present_count() >= 1);
+        assert!(!frame.pixels.is_empty());
+
+        let preview_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/m32-preview");
+        let preview_request = preview_dir.join(".request-first-frame-bmp");
+        if preview_request.is_file() {
+            write_first_frame_preview_bmp(&preview_dir.join("first-frame.bmp"), &frame)
+                .expect("first-frame BMP preview must be written");
+        }
+
+        let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+        assert!(contains_bytes(&stdout, FIRST_FRAME_CANVAS_READY_SENTINEL));
     }
 
     #[test]
