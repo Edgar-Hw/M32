@@ -2203,15 +2203,67 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
         })
     }
 
-    fn tick_until_first_captured_frame(
+    fn create_first_frame_running_wie_session(
+        hosts: WiePlatformHosts,
+    ) -> Result<WieSession, EmulatorSessionCreateError> {
+        let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+        let emulator = wie_j2me::J2MEEmulator::from_jad_jar(
+            platform,
+            FIRST_FRAME_RUNNING_JAD.to_vec(),
+            "j2me-first-frame-running.jar".to_owned(),
+            FIRST_FRAME_RUNNING_JAR.to_vec(),
+        )
+        .map_err(map_session_create_error)?;
+
+        Ok(WieSession {
+            emulator: Box::new(emulator),
+            state: SessionState::Ready,
+        })
+    }
+
+    fn create_core_smoke_missing_main_wie_session(
+        hosts: WiePlatformHosts,
+    ) -> Result<WieSession, EmulatorSessionCreateError> {
+        let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+        let emulator = wie_j2me::J2MEEmulator::from_jar(
+            platform,
+            "j2me-core-smoke-missing-main.jar",
+            CORE_SMOKE_MISSING_MAIN_JAR.to_vec(),
+        )
+        .map_err(map_session_create_error)?;
+
+        Ok(WieSession {
+            emulator: Box::new(emulator),
+            state: SessionState::Ready,
+        })
+    }
+
+    enum FirstFrameWaitError {
+        SessionFault {
+            tick: usize,
+            error: EmulatorSessionError,
+        },
+        Timeout {
+            max_ticks: usize,
+            redraws: u32,
+            presents: u32,
+            state: SessionState,
+        },
+    }
+
+    fn try_tick_until_first_captured_frame(
         session: &mut WieSession,
         display: &FirstFrameCaptureDisplayHost,
         max_ticks: usize,
-    ) -> RgbaFrame {
+    ) -> Result<RgbaFrame, FirstFrameWaitError> {
         let mut forwarded_redraws = 0_u32;
 
-        for _ in 0..max_ticks {
-            session.tick().expect("paint fixture must not fault before first frame");
+        for tick in 1..=max_ticks {
+            if let Err(error) = session.tick() {
+                return Err(FirstFrameWaitError::SessionFault { tick, error });
+            }
 
             let requested_redraws = display.redraw_count();
             while forwarded_redraws < requested_redraws {
@@ -2220,15 +2272,42 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
             }
 
             if let Some(frame) = display.first_frame() {
-                return frame;
+                return Ok(frame);
             }
         }
 
-        panic!(
-            "first guest-generated frame was not captured within {max_ticks} ticks; redraws={}, presents={}",
-            display.redraw_count(),
-            display.present_count(),
-        );
+        Err(FirstFrameWaitError::Timeout {
+            max_ticks,
+            redraws: display.redraw_count(),
+            presents: display.present_count(),
+            state: session.state(),
+        })
+    }
+
+    fn tick_until_first_captured_frame(
+        session: &mut WieSession,
+        display: &FirstFrameCaptureDisplayHost,
+        max_ticks: usize,
+    ) -> RgbaFrame {
+        match try_tick_until_first_captured_frame(session, display, max_ticks) {
+            Ok(frame) => frame,
+            Err(FirstFrameWaitError::SessionFault { tick, error }) => {
+                panic!(
+                    "guest session faulted before first frame at tick {tick}: code={:?}, message={}",
+                    error.code, error.message,
+                );
+            }
+            Err(FirstFrameWaitError::Timeout {
+                max_ticks,
+                redraws,
+                presents,
+                state,
+            }) => {
+                panic!(
+                    "first guest-generated frame was not captured within {max_ticks} ticks; redraws={redraws}, presents={presents}, state={state:?}"
+                );
+            }
+        }
     }
 
     fn write_first_frame_preview_bmp(path: &std::path::Path, frame: &RgbaFrame) -> std::io::Result<()> {
@@ -2362,6 +2441,97 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
 
         let stdout = output.stdout.lock().expect("stdout mutex poisoned");
         assert!(contains_bytes(&stdout, FIRST_FRAME_CANVAS_READY_SENTINEL));
+    }
+
+    #[test]
+    fn first_frame_wait_times_out_cleanly_when_running_midlet_never_paints() {
+        let display = Arc::new(FirstFrameCaptureDisplayHost::default());
+        display
+            .resize(DisplaySize::new(176, 220))
+            .expect("timeout fixture logical screen size must be accepted");
+
+        let output = Arc::new(RecordingOutput::default());
+        let hosts = WiePlatformHosts {
+            display: display.clone(),
+            clock: Arc::new(DeterministicAdvancingClock::new(1_725_123_456_789, 1)),
+            database: Arc::new(RecordingDatabaseRepository::default()),
+            filesystem: Arc::new(RecordingFilesystemHost::default()),
+            audio: Arc::new(RecordingAudioHost::default()),
+            output: output.clone(),
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        };
+
+        let mut session = create_first_frame_running_wie_session(hosts)
+            .expect("RunningMidlet timeout fixture must construct a WIE session");
+
+        let result = try_tick_until_first_captured_frame(&mut session, &display, FIRST_FRAME_BOOT_MAX_TICKS);
+
+        match result {
+            Err(FirstFrameWaitError::Timeout {
+                max_ticks,
+                redraws,
+                presents,
+                state,
+            }) => {
+                assert_eq!(max_ticks, FIRST_FRAME_BOOT_MAX_TICKS);
+                assert_eq!(redraws, 0);
+                assert_eq!(presents, 0);
+                assert_eq!(state, SessionState::Running);
+            }
+            Err(FirstFrameWaitError::SessionFault { tick, error }) => {
+                panic!(
+                    "RunningMidlet must time out without faulting; tick={tick}, code={:?}, message={}",
+                    error.code, error.message,
+                );
+            }
+            Ok(_) => panic!("RunningMidlet must not synthesize a first frame"),
+        }
+
+        assert_eq!(display.first_frame(), None);
+
+        let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+        assert!(contains_bytes(&stdout, FIRST_FRAME_BOOT_SENTINEL));
+    }
+
+    #[test]
+    fn first_frame_wait_reports_backend_fault_before_timeout() {
+        let display = Arc::new(FirstFrameCaptureDisplayHost::default());
+        display
+            .resize(DisplaySize::new(176, 220))
+            .expect("fault-boundary logical screen size must be accepted");
+
+        let hosts = WiePlatformHosts {
+            display: display.clone(),
+            clock: Arc::new(DeterministicAdvancingClock::new(1_725_123_456_789, 1)),
+            database: Arc::new(RecordingDatabaseRepository::default()),
+            filesystem: Arc::new(RecordingFilesystemHost::default()),
+            audio: Arc::new(RecordingAudioHost::default()),
+            output: Arc::new(RecordingOutput::default()),
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        };
+
+        let mut session = create_core_smoke_missing_main_wie_session(hosts)
+            .expect("missing-main fixture must construct a Ready WIE session");
+
+        let result = try_tick_until_first_captured_frame(&mut session, &display, CORE_SMOKE_MAX_TICKS);
+
+        match result {
+            Err(FirstFrameWaitError::SessionFault { tick, error }) => {
+                assert!(tick <= CORE_SMOKE_MAX_TICKS);
+                assert_eq!(error.code, SessionErrorCode::BackendTickFailed);
+                assert!(!error.message.is_empty());
+            }
+            Err(FirstFrameWaitError::Timeout { .. }) => {
+                panic!("backend fault must not be mislabeled as first-frame timeout");
+            }
+            Ok(_) => panic!("missing-main fixture must not produce a first frame"),
+        }
+
+        assert_eq!(session.state(), SessionState::Faulted);
+        assert_eq!(display.first_frame(), None);
+        assert_eq!(display.present_count(), 0);
     }
 
     #[test]
