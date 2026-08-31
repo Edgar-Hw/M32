@@ -14,3 +14,6 @@ tracing.workspace = true
 wie_backend.workspace = true
 wie_j2me.workspace = true
 wie_util.workspace = true
+
+[dev-dependencies]
+m32-storage = { path = "../m32-storage" }

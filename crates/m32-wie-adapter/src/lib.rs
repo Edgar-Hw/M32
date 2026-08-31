@@ -703,12 +703,46 @@ fn copy_wie_image_to_rgba8(image: &dyn wie_backend::canvas::Image) -> Option<Rgb
 mod tests {
     use std::{
         borrow::Cow,
-        sync::{Arc, Mutex},
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use super::*;
     use m32_emulator_api::DisplayHostErrorCode;
+    use m32_storage::PersistentGuestStorage;
     use wie_backend::{Screen, canvas::Color};
+
+    static NEXT_STORAGE_INTEGRATION_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct StorageIntegrationRoot {
+        path: PathBuf,
+    }
+
+    impl StorageIntegrationRoot {
+        fn new() -> Self {
+            let id = NEXT_STORAGE_INTEGRATION_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("m32-wie-storage-integration-{}-{id}", std::process::id()));
+
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("storage integration temp root must be created");
+
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for StorageIntegrationRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum RecordedInputPhase {
@@ -2006,6 +2040,40 @@ mod tests {
         );
     }
 
+    fn persistent_storage_platform_hosts(
+        storage: &PersistentGuestStorage,
+        output: Arc<RecordingOutput>,
+    ) -> WiePlatformHosts {
+        WiePlatformHosts {
+            display: Arc::new(RecordingDisplayHost::default()),
+            clock: Arc::new(DeterministicAdvancingClock::new(1_725_123_456_789, 1)),
+            database: Arc::new(storage.database_repository()),
+            filesystem: Arc::new(storage.filesystem()),
+            audio: Arc::new(RecordingAudioHost::default()),
+            output,
+            exit: Arc::new(RecordingExit::default()),
+            vibration: Arc::new(RecordingVibration::default()),
+        }
+    }
+
+    fn tick_until_stdout_contains_rms_sentinel(session: &mut WieSession, output: &RecordingOutput, sentinel: &[u8]) {
+        for _ in 0..RMS_PERSISTENCE_MAX_TICKS {
+            session.tick().expect("RMS persistence fixture must not fault");
+
+            let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+            if contains_bytes(&stdout, sentinel) {
+                return;
+            }
+        }
+
+        let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+        panic!(
+            "RMS persistence sentinel not observed; sentinel={:?}; stdout={:?}",
+            String::from_utf8_lossy(sentinel),
+            String::from_utf8_lossy(&stdout),
+        );
+    }
+
     fn audio_mmapi_platform_hosts(output: Arc<RecordingOutput>, audio: Arc<RecordingAudioHost>) -> WiePlatformHosts {
         WiePlatformHosts {
             display: Arc::new(RecordingDisplayHost::default()),
@@ -2301,6 +2369,36 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
     const AUDIO_MMAPI_PLAY_SENTINEL: &[u8] = b"M32_AUDIO_PLAY_SENT;";
     const AUDIO_MMAPI_STOP_SENTINEL: &[u8] = b"M32_AUDIO_STOP_SENT;";
     const AUDIO_MMAPI_MAX_TICKS: usize = 512;
+
+    const RMS_PERSISTENCE_JAD: &[u8] = include_bytes!("../test-fixtures/j2me-rms-persistence.jad");
+    const RMS_PERSISTENCE_JAR: &[u8] = include_bytes!("../test-fixtures/j2me-rms-persistence.jar");
+    const RMS_PERSISTENCE_SOURCE: &str = include_str!("../test-fixtures/src/m32/RmsPersistenceMidlet.java");
+    const RMS_PERSISTENCE_APP_ID: &str = "M32 RMS Persistence";
+    const RMS_PERSISTENCE_STORE_NAME: &str = "m32-rms";
+    const RMS_PERSISTENCE_PAYLOAD: &[u8] = b"M32-RMS1";
+    const RMS_SAVED_SENTINEL: &[u8] = b"M32_RMS_SAVED;";
+    const RMS_LOADED_SENTINEL: &[u8] = b"M32_RMS_LOADED_OK;";
+    const RMS_FAILURE_SENTINEL: &[u8] = b"M32_RMS_FAILURE;";
+    const RMS_BAD_ID_SENTINEL: &[u8] = b"M32_RMS_BAD_ID;";
+    const RMS_BAD_LOAD_SENTINEL: &[u8] = b"M32_RMS_LOADED_BAD;";
+    const RMS_PERSISTENCE_MAX_TICKS: usize = 512;
+
+    fn create_rms_persistence_wie_session(hosts: WiePlatformHosts) -> Result<WieSession, EmulatorSessionCreateError> {
+        let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
+
+        let emulator = wie_j2me::J2MEEmulator::from_jad_jar(
+            platform,
+            RMS_PERSISTENCE_JAD.to_vec(),
+            "j2me-rms-persistence.jar".to_owned(),
+            RMS_PERSISTENCE_JAR.to_vec(),
+        )
+        .map_err(map_session_create_error)?;
+
+        Ok(WieSession {
+            emulator: Box::new(emulator),
+            state: SessionState::Ready,
+        })
+    }
 
     fn create_audio_mmapi_wie_session(hosts: WiePlatformHosts) -> Result<WieSession, EmulatorSessionCreateError> {
         let platform: Box<dyn wie_backend::Platform> = Box::new(WiePlatformAdapter::new(hosts));
@@ -2651,6 +2749,174 @@ MIDlet-1: M32 First Frame,,m32.FirstFrameMidlet\r\n";
 
         let stdout = output.stdout.lock().expect("stdout mutex poisoned");
         assert!(contains_bytes(&stdout, FIRST_FRAME_CANVAS_READY_SENTINEL));
+    }
+
+    #[test]
+    fn persistent_storage_hosts_are_accepted_by_wie_platform() {
+        let temp = StorageIntegrationRoot::new();
+        let storage = PersistentGuestStorage::open(temp.path()).expect("persistent storage must open");
+        let platform = WiePlatformAdapter::new(persistent_storage_platform_hosts(
+            &storage,
+            Arc::new(RecordingOutput::default()),
+        ));
+        let platform_ref: &dyn wie_backend::Platform = &platform;
+
+        let mut database = block_on_ready(wie_backend::DatabaseRepository::open(
+            platform_ref.database_repository(),
+            "platform-rms",
+            "platform-app",
+        ));
+        let record_id = block_on_ready(wie_backend::Database::add(&mut *database, b"PLATFORM"));
+        assert_eq!(record_id, 1);
+        assert_eq!(
+            block_on_ready(wie_backend::Database::get(&*database, record_id)),
+            Some(b"PLATFORM".to_vec())
+        );
+
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::write(
+                platform_ref.filesystem(),
+                "platform-aid",
+                "save/state.bin",
+                0,
+                b"FILE",
+            )),
+            4
+        );
+        assert_eq!(
+            block_on_ready(wie_backend::Filesystem::size(
+                platform_ref.filesystem(),
+                "platform-aid",
+                "save/state.bin",
+            )),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn rms_persistence_fixture_locks_real_record_store_contract() {
+        assert!(RMS_PERSISTENCE_JAR.starts_with(b"PK\x03\x04"));
+        assert!(contains_bytes(RMS_PERSISTENCE_JAD, b"MIDlet-Name: M32 RMS Persistence"));
+        assert!(contains_bytes(
+            RMS_PERSISTENCE_JAD,
+            b"MIDlet-1: M32 RMS Persistence,,m32.RmsPersistenceMidlet"
+        ));
+        assert!(contains_bytes(RMS_PERSISTENCE_JAR, b"m32/RmsPersistenceMidlet.class"));
+        assert!(RMS_PERSISTENCE_SOURCE.contains("RecordStore.openRecordStore(\"m32-rms\", true)"));
+        assert!(RMS_PERSISTENCE_SOURCE.contains("store.getNumRecords() == 0"));
+        assert!(RMS_PERSISTENCE_SOURCE.contains("store.addRecord(expected, 0, expected.length)"));
+        assert!(RMS_PERSISTENCE_SOURCE.contains("store.getRecord(1)"));
+        assert!(contains_bytes(RMS_PERSISTENCE_JAR, RMS_SAVED_SENTINEL));
+        assert!(contains_bytes(RMS_PERSISTENCE_JAR, RMS_LOADED_SENTINEL));
+    }
+
+    #[test]
+    fn real_j2me_rms_survives_session_and_storage_rebuild() {
+        let temp = StorageIntegrationRoot::new();
+
+        {
+            let storage =
+                PersistentGuestStorage::open(temp.path()).expect("first persistent storage instance must open");
+            let output = Arc::new(RecordingOutput::default());
+            let hosts = persistent_storage_platform_hosts(&storage, output.clone());
+            let mut session =
+                create_rms_persistence_wie_session(hosts).expect("RMS fixture first session must construct");
+
+            assert_eq!(session.state(), SessionState::Ready);
+            tick_until_stdout_contains_rms_sentinel(&mut session, &output, RMS_SAVED_SENTINEL);
+            assert_eq!(session.state(), SessionState::Running);
+
+            let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+            assert!(!contains_bytes(&stdout, RMS_FAILURE_SENTINEL));
+            assert!(!contains_bytes(&stdout, RMS_BAD_ID_SENTINEL));
+            drop(stdout);
+
+            let repository = storage.database_repository();
+            assert!(
+                block_on_ready(repository.exists(RMS_PERSISTENCE_STORE_NAME, RMS_PERSISTENCE_APP_ID,))
+                    .expect("RMS database existence must query")
+            );
+            assert_eq!(
+                block_on_ready(repository.usage(RMS_PERSISTENCE_APP_ID)).expect("RMS usage must query"),
+                RMS_PERSISTENCE_PAYLOAD.len() as u64
+            );
+        }
+
+        {
+            let storage =
+                PersistentGuestStorage::open(temp.path()).expect("second persistent storage instance must reopen");
+            let output = Arc::new(RecordingOutput::default());
+            let hosts = persistent_storage_platform_hosts(&storage, output.clone());
+            let mut session =
+                create_rms_persistence_wie_session(hosts).expect("RMS fixture second session must construct");
+
+            assert_eq!(session.state(), SessionState::Ready);
+            tick_until_stdout_contains_rms_sentinel(&mut session, &output, RMS_LOADED_SENTINEL);
+            assert_eq!(session.state(), SessionState::Running);
+
+            let stdout = output.stdout.lock().expect("stdout mutex poisoned");
+            assert!(!contains_bytes(&stdout, RMS_FAILURE_SENTINEL));
+            assert!(!contains_bytes(&stdout, RMS_BAD_LOAD_SENTINEL));
+            assert!(!contains_bytes(&stdout, RMS_SAVED_SENTINEL));
+        }
+    }
+
+    #[test]
+    fn persistent_wie_filesystem_survives_platform_rebuild() {
+        let temp = StorageIntegrationRoot::new();
+        const AID: &str = "M32 Persistent Filesystem";
+        const PATH: &str = "save/state.bin";
+        const PAYLOAD: &[u8] = b"M32-FS-PERSIST";
+
+        {
+            let storage =
+                PersistentGuestStorage::open(temp.path()).expect("first persistent storage instance must open");
+            let platform = WiePlatformAdapter::new(persistent_storage_platform_hosts(
+                &storage,
+                Arc::new(RecordingOutput::default()),
+            ));
+
+            assert_eq!(
+                block_on_ready(wie_backend::Filesystem::write(
+                    wie_backend::Platform::filesystem(&platform),
+                    AID,
+                    PATH,
+                    0,
+                    PAYLOAD,
+                )),
+                PAYLOAD.len()
+            );
+        }
+
+        {
+            let storage =
+                PersistentGuestStorage::open(temp.path()).expect("second persistent storage instance must reopen");
+            let platform = WiePlatformAdapter::new(persistent_storage_platform_hosts(
+                &storage,
+                Arc::new(RecordingOutput::default()),
+            ));
+            let filesystem = wie_backend::Platform::filesystem(&platform);
+
+            assert!(block_on_ready(wie_backend::Filesystem::exists(filesystem, AID, PATH)));
+            assert_eq!(
+                block_on_ready(wie_backend::Filesystem::size(filesystem, AID, PATH)),
+                Some(PAYLOAD.len())
+            );
+
+            let mut buffer = vec![0_u8; PAYLOAD.len()];
+            assert_eq!(
+                block_on_ready(wie_backend::Filesystem::read(
+                    filesystem,
+                    AID,
+                    PATH,
+                    0,
+                    buffer.len(),
+                    &mut buffer,
+                )),
+                Some(PAYLOAD.len())
+            );
+            assert_eq!(buffer.as_slice(), PAYLOAD);
+        }
     }
 
     #[test]
